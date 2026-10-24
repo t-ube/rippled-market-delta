@@ -245,6 +245,24 @@ public:
     tx_type
     txRead(key_type const& key) const override;
 
+    // Compare two published snapshots using only indices touched in
+    // either open-view modification table. Used by the shadow observer on
+    // its own worker thread, never from the transaction application path.
+    void
+    visitChangesSince(
+        OpenView const& previous,
+        std::function<void(uint256 const&, SLE::const_pointer, SLE::const_pointer)> const& visit)
+        const
+    {
+        items_.visitDiffKeys(previous.items_, [&](uint256 const& key) {
+            auto const before = previous.read(keylet::unchecked(key));
+            auto const after = read(keylet::unchecked(key));
+            if ((!before && !after) || (before && after && *before == *after))
+                return;
+            visit(key, before, after);
+        });
+    }
+
     // RawView
 
     void
