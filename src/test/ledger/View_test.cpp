@@ -1047,12 +1047,72 @@ class View_test : public beast::unit_test::Suite
     }
 
     void
+    testMarketDeltaSnapshots()
+    {
+        testcase("MarketDelta committed snapshot comparison");
+
+        using namespace jtx;
+        Env env(*this);
+        auto const base = env.current();
+        OpenView before(base.get());
+        OpenView created(before);
+
+        constexpr std::uint64_t id = 0xA11CE123;
+        created.rawInsert(sle(id, 1));
+
+        std::vector<uint256> keys;
+        created.visitChangesSince(
+            before,
+            [&](uint256 const& key, SLE::const_pointer oldEntry, SLE::const_pointer newEntry) {
+                keys.push_back(key);
+                BEAST_EXPECT(!oldEntry && newEntry);
+            });
+        BEAST_EXPECT(keys.size() == 1);
+        BEAST_EXPECT(keys[0] == k(id).key);
+
+        OpenView unchanged(created);
+        std::size_t unchangedCount = 0;
+        unchanged.visitChangesSince(
+            created, [&](uint256 const&, SLE::const_pointer, SLE::const_pointer) {
+                ++unchangedCount;
+            });
+        BEAST_EXPECT(unchangedCount == 0);
+
+        OpenView modified(created);
+        modified.rawReplace(sle(id, 2));
+        std::size_t modifiedCount = 0;
+        modified.visitChangesSince(
+            created,
+            [&](uint256 const& key, SLE::const_pointer oldEntry, SLE::const_pointer newEntry) {
+                ++modifiedCount;
+                BEAST_EXPECT(key == k(id).key);
+                BEAST_EXPECT(oldEntry && newEntry);
+                BEAST_EXPECT(oldEntry->getFieldU32(sfSequence) == 1);
+                BEAST_EXPECT(newEntry->getFieldU32(sfSequence) == 2);
+            });
+        BEAST_EXPECT(modifiedCount == 1);
+
+        OpenView erased(created);
+        erased.rawErase(sle(id, 1));
+        std::size_t erasedCount = 0;
+        erased.visitChangesSince(
+            created,
+            [&](uint256 const& key, SLE::const_pointer oldEntry, SLE::const_pointer newEntry) {
+                ++erasedCount;
+                BEAST_EXPECT(key == k(id).key);
+                BEAST_EXPECT(oldEntry && !newEntry);
+            });
+        BEAST_EXPECT(erasedCount == 1);
+    }
+
+    void
     run() override
     {
         // This had better work, or else
         BEAST_EXPECT(k(0).key < k(1).key);
 
         testLedger();
+        testMarketDeltaSnapshots();
         testMeta();
         testMetaSucc();
         testStacked();
