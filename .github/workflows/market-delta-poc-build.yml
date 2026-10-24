@@ -1,0 +1,76 @@
+# Fork-only compilation gate for the shadow Market Delta PoC.
+# Uses GitHub-hosted runners; upstream PR CI requires unavailable XRPLF self-hosted runners.
+# No deployment, node restart, or network trading actions are performed.
+name: Market Delta PoC Linux Build
+
+on:
+  push:
+    branches:
+      - feature/open-market-delta-poc
+    paths:
+      - .github/workflows/market-delta-poc-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-view-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: ghcr.io/xrplf/xrpld/nix-ubuntu:sha-473fe44
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang
+      CXX: clang++
+      CONAN_HOME: /tmp/.conan2-market-delta
+
+    steps:
+      - name: Checkout PoC branch
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          clang++ --version
+          cmake --version
+          conan --version
+          df -h .
+
+      - name: Set up Conan profiles and remote
+        run: ./conan/init.sh
+
+      - name: Install required dependencies
+        run: |
+          conan install \
+            --profile:all ci \
+            --build=missing \
+            --options:host='&:tests=True' \
+            --options:host='&:xrpld=True' \
+            --settings:all build_type=Release \
+            --conf:all tools.build:jobs=2 \
+            --conf:all tools.build:verbosity=quiet \
+            --conf:all tools.compilation:verbosity=quiet \
+            .
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -Dxrpld=ON \
+            -Dtests=ON \
+            -Dwerr=ON \
+            -Drust=OFF
+
+      - name: Compile xrpld
+        run: cmake --build build --parallel 2 --target xrpld
+
+      - name: Run OpenView regression suite
+        run: ./build/xrpld --unittest xrpl.ledger.View
+
+      - name: Check remaining disk space
+        if: always()
+        run: df -h .
