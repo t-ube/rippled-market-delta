@@ -121,7 +121,10 @@ jobs:
           target="$(docker run --rm --entrypoint /bin/sh xrplf/xrpld:3.4.1 -c 'command -v xrpld')"
           case "$target" in
               /*) echo "TARGET_BIN=$target" >>"$GITHUB_ENV" ;;
-              *) echo "Unable to locate upstream executable" >&2; exit 1 ;;
+              *)
+                  echo "Unable to locate upstream executable" >&2
+                  exit 1
+                  ;;
           esac
 
       - name: Build the fork image

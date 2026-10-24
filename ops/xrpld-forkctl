@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Controlled switch between official xrpld and the shadow-only Market Delta fork."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SERVER = Path(os.environ.get("XRPLD_SERVER_DIR", "/opt/xrpl-arb/server")).resolve()
+IMAGE = os.environ.get(
+    "XRPLD_FORK_IMAGE", "ghcr.io/t-ube/rippled-market-delta:market-delta-poc"
+)
+STATE = SERVER / ".xrpld-market-delta-state.json"
+OVERRIDE = SERVER / ".xrpld-market-delta.override.yml"
+SOCKET_DIR = SERVER / "data/market-delta"
+TIMEOUT = int(os.environ.get("XRPLD_FORK_TIMEOUT", "900"))
+
+
+def run(*args: str, capture: bool = False, check: bool = True) -> str:
+    result = subprocess.run(
+        args,
+        cwd=SERVER,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if check and result.returncode:
+        message = result.stderr if capture else ""
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {' '.join(args)}\n{message}"
+        )
+    return (result.stdout or "").strip()
+
+
+def base_file() -> Path:
+    filenames = (
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    )
+    for filename in filenames:
+        candidate = SERVER / filename
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"No Compose file in {SERVER}")
+
+
+def compose(
+    base: Path, *args: str, override: bool = False, capture: bool = False
+) -> str:
+    cmd = ["docker", "compose", "-f", str(base)]
+    if override:
+        cmd += ["-f", str(OVERRIDE)]
+    return run(*cmd, *args, capture=capture)
+
+
+def configuration(base: Path, override: bool = False) -> dict:
+    output = compose(base, "config", "--format", "json", override=override, capture=True)
+    return json.loads(output)
+
+
+def assert_configuration(base: Path) -> None:
+    standard = configuration(base)["services"]["xrpld"]
+    changed = configuration(base, override=True)["services"]["xrpld"]
+    if standard.get("network_mode") != changed.get("network_mode"):
+        raise RuntimeError("Network mode changed; refusing to update")
+    if standard.get("user") != changed.get("user"):
+        raise RuntimeError("Container user changed; refusing to update")
+    existing = {v["target"]: v["source"] for v in standard.get("volumes", [])}
+    new = {v["target"]: v["source"] for v in changed.get("volumes", [])}
+    if existing.get("/var/lib/xrpld/db") is None:
+        raise RuntimeError("NuDB bind mount was not found")
+    if any(new.get(target) != source for target, source in existing.items()):
+        raise RuntimeError("Existing mounts changed; refusing to update")
+    if new.get("/run/market-delta") != str(SOCKET_DIR):
+        raise RuntimeError("Notification socket mount is not configured as expected")
+    if changed.get("stop_grace_period") not in ("2m0s", "2m"):
+        raise RuntimeError("Two-minute stop grace period is missing")
+
+
+def book_running(base: Path) -> bool:
+    ident = compose(base, "ps", "-q", "book", capture=True)
+    if not ident:
+        return False
+    return run(
+        "docker", "inspect", "-f", "{{.State.Running}}", ident, capture=True
+    ) == "true"
+
+
+def wait_for_full() -> None:
+    deadline = time.monotonic() + TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            output = run(
+                "docker", "exec", "xrpld", "xrpld", "server_info", capture=True
+            )
+            payload = json.loads(output)
+            info = payload.get("result", {}).get("info", payload.get("info", {}))
+            if info.get("server_state") == "full":
+                print("xrpld is full")
+                return
+        except (RuntimeError, ValueError, KeyError):
+            pass
+        time.sleep(10)
+    raise RuntimeError("xrpld did not reach full state; rollback required")
+
+
+def write_override(image: str) -> None:
+    valid = r"ghcr\.io/t-ube/rippled-market-delta@sha256:[0-9a-f]{64}"
+    if not re.fullmatch(valid, image):
+        raise RuntimeError("A pinned GHCR image digest is required")
+    SOCKET_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    SOCKET_DIR.chmod(0o700)
+    OVERRIDE.write_text(
+        "services:\n"
+        "  xrpld:\n"
+        f"    image: {image}\n"
+        "    environment:\n"
+        "      XRPLD_MARKET_DELTA_SOCKET: /run/market-delta/stream.sock\n"
+        "    volumes:\n"
+        f"      - {SOCKET_DIR}:/run/market-delta\n"
+        "    stop_grace_period: 2m\n",
+        encoding="utf-8",
+    )
+
+
+def restore(base: Path, resume_book: bool) -> None:
+    compose(base, "up", "-d", "--no-deps", "--force-recreate", "xrpld")
+    wait_for_full()
+    if resume_book:
+        compose(base, "start", "book")
+    OVERRIDE.unlink(missing_ok=True)
+    STATE.unlink(missing_ok=True)
+
+
+def update(base: Path) -> None:
+    if STATE.exists() or OVERRIDE.exists():
+        raise RuntimeError("Fork deployment already exists; rollback before updating")
+    print(f"Pulling {IMAGE} before touching the live service")
+    run("docker", "pull", IMAGE)
+    digest = run(
+        "docker", "image", "inspect", "-f", "{{index .RepoDigests 0}}", IMAGE,
+        capture=True,
+    )
+    if not digest.startswith("ghcr.io/t-ube/rippled-market-delta@sha256:"):
+        raise RuntimeError(f"Unexpected image digest: {digest}")
+    write_override(digest)
+    try:
+        assert_configuration(base)
+    except Exception:
+        OVERRIDE.unlink(missing_ok=True)
+        raise
+    was_running = book_running(base)
+    STATE.write_text(
+        json.dumps({"image": digest, "resume_book": was_running}, indent=2) + "\n"
+    )
+    if was_running:
+        compose(base, "stop", "book")
+    try:
+        compose(
+            base, "up", "-d", "--no-deps", "--force-recreate", "xrpld",
+            override=True,
+        )
+        wait_for_full()
+        if not (SOCKET_DIR / "stream.sock").is_socket():
+            raise RuntimeError("The market-delta socket was not created")
+        if was_running:
+            compose(base, "start", "book")
+        print(f"Production shadow feed active: {digest}")
+    except Exception:
+        print(
+            "Update failed; attempting automatic rollback to original Compose",
+            file=sys.stderr,
+        )
+        restore(base, was_running)
+        raise
+
+
+def rollback(base: Path) -> None:
+    if not STATE.exists():
+        raise RuntimeError("No fork state found; nothing to roll back")
+    state = json.loads(STATE.read_text())
+    if book_running(base):
+        compose(base, "stop", "book")
+    restore(base, bool(state.get("resume_book")))
+    print("Restored original Compose image")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("status", "update", "rollback"))
+    args = parser.parse_args()
+    if not SERVER.is_dir():
+        raise RuntimeError(f"Server directory does not exist: {SERVER}")
+    base = base_file()
+    if args.command == "status":
+        image = run(
+            "docker", "inspect", "-f", "{{.Config.Image}}", "xrpld", capture=True
+        )
+        print(image)
+        print("Fork state:", STATE.read_text() if STATE.exists() else "not active")
+        print(
+            run("docker", "exec", "xrpld", "xrpld", "server_info", capture=True)
+        )
+    elif args.command == "update":
+        update(base)
+    else:
+        rollback(base)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, OSError) as error:
+        print(f"xrpld-forkctl: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
