@@ -47,6 +47,36 @@ public:
     RawStateTable&
     operator=(RawStateTable const&) = delete;
 
+    // Enumerate the union of locally touched indices, without walking the
+    // complete validated ledger. The caller compares before/after values.
+    void
+    visitDiffKeys(RawStateTable const& previous, std::function<void(key_type const&)> const& visit)
+        const
+    {
+        auto a = items_.begin();
+        auto b = previous.items_.begin();
+        while (a != items_.end() || b != previous.items_.end())
+        {
+            if (b == previous.items_.end() ||
+                (a != items_.end() && a->first < b->first))
+            {
+                visit(a->first);
+                ++a;
+            }
+            else if (a == items_.end() || b->first < a->first)
+            {
+                visit(b->first);
+                ++b;
+            }
+            else
+            {
+                visit(a->first);
+                ++a;
+                ++b;
+            }
+        }
+    }
+
     void
     apply(RawView& to) const;
 
