@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -48,7 +50,16 @@ public:
             auto const* path = std::getenv("XRPLD_MARKET_DELTA_SOCKET");
             if (!path || !*path)
                 return std::unique_ptr<MarketDeltaTap>{};
-            return std::unique_ptr<MarketDeltaTap>(new MarketDeltaTap(path));
+            try
+            {
+                return std::unique_ptr<MarketDeltaTap>(new MarketDeltaTap(path));
+            }
+            catch (...)
+            {
+                // Even failing to start the observer must never stop xrpld.
+                std::fprintf(stderr, "market-delta: optional observer unavailable\\n");
+                return std::unique_ptr<MarketDeltaTap>{};
+            }
         }();
         return tap.get();
 #else
