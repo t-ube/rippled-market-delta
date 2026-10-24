@@ -61,7 +61,9 @@ def compose(
 
 
 def configuration(base: Path, override: bool = False) -> dict:
-    output = compose(base, "config", "--format", "json", override=override, capture=True)
+    output = compose(
+        base, "config", "--format", "json", override=override, capture=True
+    )
     return json.loads(output)
 
 
@@ -88,9 +90,10 @@ def book_running(base: Path) -> bool:
     ident = compose(base, "ps", "-q", "book", capture=True)
     if not ident:
         return False
-    return run(
-        "docker", "inspect", "-f", "{{.State.Running}}", ident, capture=True
-    ) == "true"
+    return (
+        run("docker", "inspect", "-f", "{{.State.Running}}", ident, capture=True)
+        == "true"
+    )
 
 
 def wait_for_full() -> None:
@@ -145,7 +148,12 @@ def update(base: Path) -> None:
     print(f"Pulling {IMAGE} before touching the live service")
     run("docker", "pull", IMAGE)
     digest = run(
-        "docker", "image", "inspect", "-f", "{{index .RepoDigests 0}}", IMAGE,
+        "docker",
+        "image",
+        "inspect",
+        "-f",
+        "{{index .RepoDigests 0}}",
+        IMAGE,
         capture=True,
     )
     if not digest.startswith("ghcr.io/t-ube/rippled-market-delta@sha256:"):
@@ -164,7 +172,12 @@ def update(base: Path) -> None:
         compose(base, "stop", "book")
     try:
         compose(
-            base, "up", "-d", "--no-deps", "--force-recreate", "xrpld",
+            base,
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "xrpld",
             override=True,
         )
         wait_for_full()
@@ -205,9 +218,7 @@ def main() -> int:
         )
         print(image)
         print("Fork state:", STATE.read_text() if STATE.exists() else "not active")
-        print(
-            run("docker", "exec", "xrpld", "xrpld", "server_info", capture=True)
-        )
+        print(run("docker", "exec", "xrpld", "xrpld", "server_info", capture=True))
     elif args.command == "update":
         update(base)
     else:
