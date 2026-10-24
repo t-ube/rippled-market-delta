@@ -149,7 +149,8 @@ private:
                 ready_.notify_one();
                 return;
             }
-            pending_.push_back({kind, revision, std::move(before), std::move(after), now, revision});
+            pending_.push_back(
+                {kind, revision, std::move(before), std::move(after), now, revision});
             ready_.notify_one();
         }
         catch (...)
@@ -230,8 +231,8 @@ private:
         std::size_t sent = 0;
         while (sent < line.size())
         {
-            auto const n = ::send(
-                fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+            auto const n =
+                ::send(fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
             if (n > 0)
             {
                 sent += static_cast<std::size_t>(n);
@@ -247,8 +248,7 @@ private:
                 deadline - std::chrono::steady_clock::now());
             if (remaining.count() <= 0)
                 return false;
-            auto const timeout = static_cast<int>(
-                remaining.count() > 20 ? 20 : remaining.count());
+            auto const timeout = static_cast<int>(remaining.count() > 20 ? 20 : remaining.count());
             pollfd pfd{fd, POLLOUT, 0};
             auto const ready = ::poll(&pfd, 1, timeout);
             if (ready < 0 && errno == EINTR)
@@ -375,10 +375,10 @@ private:
                 if (event.kind == Kind::Delta && pending_.size() >= coalesceThreshold_)
                 {
                     while (!pending_.empty() && pending_.front().kind == Kind::Delta &&
-                        pending_.front().after && event.after &&
-                        pending_.front().after->seq() == event.after->seq() &&
-                        pending_.front().after->header().parentHash ==
-                            event.after->header().parentHash)
+                           pending_.front().after && event.after &&
+                           pending_.front().after->seq() == event.after->seq() &&
+                           pending_.front().after->header().parentHash ==
+                               event.after->header().parentHash)
                     {
                         auto tail = std::move(pending_.front());
                         pending_.pop_front();
@@ -392,10 +392,10 @@ private:
             try
             {
                 auto const frame = encode(event);
-                if (frame.size() > 16 * 1024 * 1024 ||
-                    !writeAllOrDisconnect(client, frame))
+                if (frame.size() > 16 * 1024 * 1024 || !writeAllOrDisconnect(client, frame))
                 {
-                    std::fprintf(stderr, "market-delta: frame too large or send failed; resync required\n");
+                    std::fprintf(
+                        stderr, "market-delta: frame too large or send failed; resync required\n");
                     ::close(client);
                     client = -1;
                 }
