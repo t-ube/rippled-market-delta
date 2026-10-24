@@ -116,7 +116,9 @@ private:
             {
                 // Never silently lose a revision, even if the consumer is slow.
                 pending_.clear();
-                pending_.push_back({Kind::Gap, revision, nullptr, after, now});
+                pending_.push_back({Kind::Gap, revision, nullptr, std::move(after), now});
+                ready_.notify_one();
+                return;
             }
             pending_.push_back(
                 {kind, revision, std::move(before), std::move(after), now});
@@ -162,6 +164,8 @@ private:
             out["openLedger"] = static_cast<unsigned>(event.after->seq());
             out["parentHash"] = to_string(event.after->header().parentHash);
         }
+        if (event.kind == Kind::Gap)
+            out["reason"] = "queue_overflow";
         out["queueUs"] = std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - event.queued).count());
 
@@ -215,7 +219,23 @@ private:
         struct stat existing {};
         if (::lstat(path_.c_str(), &existing) == 0)
         {
-            if (!S_ISSOCK(existing.st_mode) || existing.st_uid != ::geteuid() ||
+            if (!S_ISSOCK(existing.st_mode) || existing.st_uid != ::geteuid())
+            {
+                ::close(server);
+                return;
+            }
+            // Never unlink the socket of another running xrpld instance.
+            int const probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (probe < 0)
+            {
+                ::close(server);
+                return;
+            }
+            int const connected = ::connect(
+                probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            int const connectErrno = errno;
+            ::close(probe);
+            if (connected == 0 || connectErrno != ECONNREFUSED ||
                 ::unlink(path_.c_str()) != 0)
             {
                 ::close(server);
