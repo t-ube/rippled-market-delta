@@ -13,10 +13,12 @@ on:
       - src/xrpld/app/ledger/**
       - src/test/ledger/View_test.cpp
       - conanfile.py
+      - ops/Dockerfile.market-delta
   workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build-and-view-test:
@@ -67,7 +69,7 @@ jobs:
               -Dxrpld=ON \
               -Dtests=ON \
               -Dwerr=ON \
-              -Drust=OFF
+              -Drust=ON
 
       - name: Compile xrpld
         run: cmake --build build --parallel 2 --target xrpld
@@ -75,6 +77,68 @@ jobs:
       - name: Run OpenView regression suite
         run: ./build/xrpld --unittest xrpl.ledger.View
 
+      - name: Confirm version
+        run: ./build/xrpld --version
+
+      - name: Upload verified executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: market-delta-xrpld
+          path: build/xrpld
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+
       - name: Check remaining disk space
         if: always()
         run: df -h .
+
+  publish-image:
+    name: Publish production-test image
+    needs: build-and-view-test
+    if: github.ref == 'refs/heads/feature/open-market-delta-poc'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/t-ube/rippled-market-delta:sha-${{ github.sha }}
+      CHANNEL_IMAGE: ghcr.io/t-ube/rippled-market-delta:market-delta-poc
+
+    steps:
+      - name: Checkout Dockerfile
+        uses: actions/checkout@v4
+
+      - name: Download verified executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: market-delta-xrpld
+          path: build
+
+      - name: Locate binary in official runtime image
+        run: |
+          docker pull xrplf/xrpld:3.4.1
+          target="$(docker run --rm --entrypoint /bin/sh xrplf/xrpld:3.4.1 -c 'command -v xrpld')"
+          case "$target" in
+              /*) echo "TARGET_BIN=$target" >>"$GITHUB_ENV" ;;
+              *) echo "Unable to locate upstream executable" >&2; exit 1 ;;
+          esac
+
+      - name: Build the fork image
+        run: docker build -f ops/Dockerfile.market-delta --build-arg TARGET_BIN="$TARGET_BIN" -t "$IMAGE" -t "$CHANNEL_IMAGE" .
+
+      - name: Verify fork image version
+        run: docker run --rm --entrypoint "$TARGET_BIN" "$IMAGE" --version
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish immutable build and channel tags
+        run: |
+          docker push "$IMAGE"
+          docker push "$CHANNEL_IMAGE"
+
+      - name: Document published image
+        run: echo "Published $IMAGE (also $CHANNEL_IMAGE)" >>"$GITHUB_STEP_SUMMARY"
