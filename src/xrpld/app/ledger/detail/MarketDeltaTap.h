@@ -98,9 +98,14 @@ private:
         Snapshot before;
         Snapshot after;
         std::chrono::steady_clock::time_point queued;
+        std::uint64_t firstRevision;
+        std::uint64_t coalesced = 0;
     };
 
-    static constexpr std::size_t maxQueued_ = 32;
+    // Process normal events in order, but absorb ledger bursts on the worker.
+    // The hard cap bounds retained snapshots if the observer stalls.
+    static constexpr std::size_t maxQueued_ = 1024;
+    static constexpr std::size_t coalesceThreshold_ = 64;
     std::string const path_;
     std::mutex mutex_;
     std::condition_variable ready_;
@@ -144,7 +149,7 @@ private:
                 ready_.notify_one();
                 return;
             }
-            pending_.push_back({kind, revision, std::move(before), std::move(after), now});
+            pending_.push_back({kind, revision, std::move(before), std::move(after), now, revision});
             ready_.notify_one();
         }
         catch (...)
@@ -180,6 +185,11 @@ private:
         out["schema"] = 1;
         out["revision"] = std::to_string(event.revision);
         out["kind"] = event.kind == Kind::Reset ? "ledger_reset" : "market_delta";
+        if (event.coalesced != 0)
+        {
+            out["revisionFrom"] = std::to_string(event.firstRevision);
+            out["coalesced"] = std::to_string(event.coalesced);
+        }
         if (event.after)
         {
             out["openLedger"] = static_cast<unsigned>(event.after->seq());
@@ -211,13 +221,42 @@ private:
     }
 
 #if defined(__linux__)
+    // AF_UNIX SOCK_STREAM can make partial writes, even without EAGAIN.
+    // Bound send latency so a slow reader never stalls this observer indefinitely.
     static bool
     writeAllOrDisconnect(int fd, std::string const& line) noexcept
     {
-        // An incomplete frame invalidates the stream. Reconnect and take a
-        // fresh snapshot instead of accidentally consuming truncated JSON.
-        auto const n = ::send(fd, line.data(), line.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
-        return n >= 0 && static_cast<std::size_t>(n) == line.size();
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        std::size_t sent = 0;
+        while (sent < line.size())
+        {
+            auto const n = ::send(
+                fd, line.data() + sent, line.size() - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if (n > 0)
+            {
+                sent += static_cast<std::size_t>(n);
+                continue;
+            }
+            if (n == 0)
+                return false;
+            if (errno == EINTR)
+                continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                return false;
+            auto const remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0)
+                return false;
+            auto const timeout = static_cast<int>(
+                remaining.count() > 20 ? 20 : remaining.count());
+            pollfd pfd{fd, POLLOUT, 0};
+            auto const ready = ::poll(&pfd, 1, timeout);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                return false;
+        }
+        return true;
     }
 
     void
@@ -331,12 +370,32 @@ private:
                     continue;
                 event = std::move(pending_.front());
                 pending_.pop_front();
+                // Consolidate only consecutive updates of the same open-ledger epoch.
+                // Never merge across a ledger reset; keep first/last snapshots.
+                if (event.kind == Kind::Delta && pending_.size() >= coalesceThreshold_)
+                {
+                    while (!pending_.empty() && pending_.front().kind == Kind::Delta &&
+                        pending_.front().after && event.after &&
+                        pending_.front().after->seq() == event.after->seq() &&
+                        pending_.front().after->header().parentHash ==
+                            event.after->header().parentHash)
+                    {
+                        auto tail = std::move(pending_.front());
+                        pending_.pop_front();
+                        event.revision = tail.revision;
+                        event.after = std::move(tail.after);
+                        event.coalesced += tail.coalesced + 1;
+                    }
+                }
             }
 
             try
             {
-                if (!writeAllOrDisconnect(client, encode(event)))
+                auto const frame = encode(event);
+                if (frame.size() > 16 * 1024 * 1024 ||
+                    !writeAllOrDisconnect(client, frame))
                 {
+                    std::fprintf(stderr, "market-delta: frame too large or send failed; resync required\n");
                     ::close(client);
                     client = -1;
                 }
