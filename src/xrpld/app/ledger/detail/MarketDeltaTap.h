@@ -19,13 +19,13 @@
 #include <cstring>
 #include <deque>
 #include <memory>
-#include <set>
-#include <vector>
 #include <mutex>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/socket.h>
@@ -266,7 +266,6 @@ private:
         return true;
     }
 
-
     static std::string
     assetKey(json::Value const& amount)
     {
@@ -333,8 +332,7 @@ private:
         json::Reader reader;
         json::Value request;
         if (!reader.parse(line.substr(0, eol), request) || !request.isObject() ||
-            !request["command"].isString() ||
-            request["command"].asString() != "snapshot" ||
+            !request["command"].isString() || request["command"].asString() != "snapshot" ||
             !request["pairs"].isArray() || request["pairs"].size() == 0 ||
             request["pairs"].size() > 4096)
             return sub;
@@ -436,31 +434,27 @@ private:
         }
         for (auto const& sle : view->sles)
         {
-            if (!sle || (sle->getType() != ltACCOUNT_ROOT &&
-                         sle->getType() != ltRIPPLE_STATE))
+            if (!sle || (sle->getType() != ltACCOUNT_ROOT && sle->getType() != ltRIPPLE_STATE))
                 continue;
             auto const data = sle->getJson();
             if (sle->getType() == ltACCOUNT_ROOT)
             {
-                if (!data["Account"].isString() ||
-                    !owners.contains(data["Account"].asString()))
+                if (!data["Account"].isString() || !owners.contains(data["Account"].asString()))
                     continue;
             }
             else
             {
                 auto const& low = data["LowLimit"];
                 auto const& high = data["HighLimit"];
-                if (!low.isObject() || !high.isObject() ||
-                    !low["issuer"].isString() || !high["issuer"].isString() ||
-                    !low["currency"].isString())
+                if (!low.isObject() || !high.isObject() || !low["issuer"].isString() ||
+                    !high["issuer"].isString() || !low["currency"].isString())
                     continue;
                 auto const l = low["issuer"].asString();
                 auto const h = high["issuer"].asString();
                 auto const cur = low["currency"].asString();
                 if (!owners.contains(l) && !owners.contains(h))
                     continue;
-                if (!assets.contains(cur + "." + l) &&
-                    !assets.contains(cur + "." + h))
+                if (!assets.contains(cur + "." + l) && !assets.contains(cur + "." + h))
                     continue;
             }
             if (!add(sle, data))
@@ -565,12 +559,12 @@ private:
                 // is sent on the same ordered socket.
                 bool ok = false;
                 if (subscription.requested)
-                    ok = writeSnapshot(
-                        client, initial, initialRevision, subscription.pairs);
+                    ok = writeSnapshot(client, initial, initialRevision, subscription.pairs);
                 else
                     ok = writeAllOrDisconnect(
                         client,
-                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}\n");
+                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}"
+                        "\n");
                 if (!ok)
                 {
                     connected_.store(false, std::memory_order_release);
