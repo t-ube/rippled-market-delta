@@ -3,6 +3,7 @@
 // Shadow-only local stream for committed open-ledger state changes.
 // Disabled unless XRPLD_MARKET_DELTA_SOCKET is set. No socket I/O or JSON
 // serialization is done on the ledger application thread.
+#include <xrpl/json/json_reader.h>
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
 #include <xrpl/ledger/OpenView.h>
@@ -18,6 +19,8 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <set>
+#include <vector>
 #include <mutex>
 #include <stop_token>
 #include <string>
@@ -110,6 +113,7 @@ private:
     std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<Event> pending_;
+    Snapshot latest_;  // Protected with pending_ and revision_ by mutex_.
     std::atomic<bool> connected_{false};
     std::atomic<bool> disconnect_{false};
     std::uint64_t revision_ = 0;
@@ -133,12 +137,15 @@ private:
     void
     enqueue(Kind kind, Snapshot before, Snapshot after) noexcept
     {
-        if (!connected_.load(std::memory_order_acquire) ||
-            disconnect_.load(std::memory_order_acquire))
-            return;
         try
         {
             std::lock_guard const lock(mutex_);
+            // Capture the latest immutable published view even without a
+            // subscriber, so the subscription boundary is always available.
+            latest_ = after;
+            if (!connected_.load(std::memory_order_relaxed) ||
+                disconnect_.load(std::memory_order_relaxed))
+                return;
             auto const now = std::chrono::steady_clock::now();
             auto const revision = ++revision_;
             if (pending_.size() >= maxQueued_)
@@ -259,6 +266,218 @@ private:
         return true;
     }
 
+
+    static std::string
+    assetKey(json::Value const& amount)
+    {
+        if (amount.isString())
+            return "XRP";
+        if (!amount.isObject() || !amount["currency"].isString())
+            return {};
+        auto const currency = amount["currency"].asString();
+        if (currency == "XRP")
+            return "XRP";
+        if (!amount["issuer"].isString())
+            return {};
+        return currency + "." + amount["issuer"].asString();
+    }
+
+    static std::string
+    pairKey(std::string const& a, std::string const& b)
+    {
+        if (a.empty() || b.empty() || a == b)
+            return {};
+        return a < b ? a + "|" + b : b + "|" + a;
+    }
+
+    struct Subscription
+    {
+        bool requested = false;
+        std::set<std::string> pairs;
+    };
+
+    static Subscription
+    readSubscription(int client)
+    {
+        Subscription sub;
+        pollfd pfd{client, POLLIN, 0};
+        if (::poll(&pfd, 1, 250) <= 0 || !(pfd.revents & POLLIN))
+            return sub;  // Legacy, receive-only subscriber.
+        sub.requested = true;
+        std::string line;
+        line.reserve(8192);
+        char block[4096];
+        while (line.size() <= 256 * 1024)
+        {
+            auto const n = ::recv(client, block, sizeof(block), MSG_DONTWAIT);
+            if (n > 0)
+            {
+                line.append(block, static_cast<std::size_t>(n));
+                if (line.find('\n') != std::string::npos)
+                    break;
+            }
+            else if (n < 0 && errno == EINTR)
+                continue;
+            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                pollfd p{client, POLLIN, 0};
+                if (::poll(&p, 1, 250) <= 0)
+                    break;
+            }
+            else
+                break;
+        }
+        auto const eol = line.find('\n');
+        if (eol == std::string::npos || line.size() > 256 * 1024)
+            return sub;
+        json::Reader reader;
+        json::Value request;
+        if (!reader.parse(line.substr(0, eol), request) || !request.isObject() ||
+            !request["command"].isString() ||
+            request["command"].asString() != "snapshot" ||
+            !request["pairs"].isArray() || request["pairs"].size() == 0 ||
+            request["pairs"].size() > 4096)
+            return sub;
+        for (auto const& p : request["pairs"])
+        {
+            if (!p.isString() || p.asString().size() > 120 ||
+                p.asString().find('|') == std::string::npos)
+            {
+                sub.pairs.clear();
+                return sub;
+            }
+            sub.pairs.insert(p.asString());
+        }
+        return sub;
+    }
+
+    // Send a complete, immutable initial market view before ANY queued
+    // updates. The view/revision capture and enqueue share a single mutex.
+    // Bounded chunks ensure no oversized NDJSON frames; a failed snapshot
+    // invalidates the client rather than silently creating a partial view.
+    static bool
+    writeSnapshot(
+        int client,
+        Snapshot const& view,
+        std::uint64_t revision,
+        std::set<std::string> const& pairs)
+    {
+        if (!view || pairs.empty())
+            return false;
+        json::Value begin(json::ValueType::Object);
+        begin["schema"] = 1;
+        begin["kind"] = "snapshot_begin";
+        begin["revision"] = std::to_string(revision);
+        begin["openLedger"] = static_cast<unsigned>(view->seq());
+        begin["parentHash"] = to_string(view->header().parentHash);
+        begin["pairCount"] = static_cast<unsigned>(pairs.size());
+        if (!writeAllOrDisconnect(client, json::to_string(begin) + "\n"))
+            return false;
+
+        json::Value entries(json::ValueType::Array);
+        std::set<std::string> owners;
+        std::set<std::string> assets;
+        std::size_t count = 0;
+        std::size_t bufferedBytes = 0;
+        for (auto const& pair : pairs)
+        {
+            auto const sep = pair.find('|');
+            assets.insert(pair.substr(0, sep));
+            assets.insert(pair.substr(sep + 1));
+        }
+        auto flush = [&] {
+            if (entries.size() == 0)
+                return true;
+            json::Value part(json::ValueType::Object);
+            part["schema"] = 1;
+            part["kind"] = "snapshot_chunk";
+            part["revision"] = std::to_string(revision);
+            part["entries"] = std::move(entries);
+            entries = json::Value(json::ValueType::Array);
+            bufferedBytes = 0;
+            return writeAllOrDisconnect(client, json::to_string(part) + "\n");
+        };
+        auto add = [&](SLE::const_pointer const& sle, json::Value const& data) {
+            json::Value item(json::ValueType::Object);
+            item["index"] = to_string(sle->key());
+            item["after"] = data;
+            auto const bytes = json::to_string(item).size();
+            if (bufferedBytes + bytes > 128 * 1024 && !flush())
+                return false;
+            bufferedBytes += bytes;
+            entries.append(std::move(item));
+            ++count;
+            return true;
+        };
+        // First pass: all Offers and AMMs for the tracked pairs; no book
+        // depth truncation, including all inherited validated-ledger entries.
+        for (auto const& sle : view->sles)
+        {
+            if (!sle || (sle->getType() != ltOFFER && sle->getType() != ltAMM))
+                continue;
+            auto const data = sle->getJson();
+            auto const pair = sle->getType() == ltOFFER
+                ? pairKey(assetKey(data["TakerPays"]), assetKey(data["TakerGets"]))
+                : pairKey(assetKey(data["Asset"]), assetKey(data["Asset2"]));
+            if (!pairs.contains(pair))
+                continue;
+            if (data["Account"].isString())
+                owners.insert(data["Account"].asString());
+            if (!add(sle, data))
+                return false;
+        }
+        // Include issuer settings (e.g. TransferRate) and all seller/AMM
+        // account balances required to price funds in this same revision.
+        for (auto const& asset : assets)
+        {
+            auto const sep = asset.find('.');
+            if (sep != std::string::npos)
+                owners.insert(asset.substr(sep + 1));
+        }
+        for (auto const& sle : view->sles)
+        {
+            if (!sle || (sle->getType() != ltACCOUNT_ROOT &&
+                         sle->getType() != ltRIPPLE_STATE))
+                continue;
+            auto const data = sle->getJson();
+            if (sle->getType() == ltACCOUNT_ROOT)
+            {
+                if (!data["Account"].isString() ||
+                    !owners.contains(data["Account"].asString()))
+                    continue;
+            }
+            else
+            {
+                auto const& low = data["LowLimit"];
+                auto const& high = data["HighLimit"];
+                if (!low.isObject() || !high.isObject() ||
+                    !low["issuer"].isString() || !high["issuer"].isString() ||
+                    !low["currency"].isString())
+                    continue;
+                auto const l = low["issuer"].asString();
+                auto const h = high["issuer"].asString();
+                auto const cur = low["currency"].asString();
+                if (!owners.contains(l) && !owners.contains(h))
+                    continue;
+                if (!assets.contains(cur + "." + l) &&
+                    !assets.contains(cur + "." + h))
+                    continue;
+            }
+            if (!add(sle, data))
+                return false;
+        }
+        if (!flush())
+            return false;
+        json::Value end(json::ValueType::Object);
+        end["schema"] = 1;
+        end["kind"] = "snapshot_end";
+        end["revision"] = std::to_string(revision);
+        end["openLedger"] = static_cast<unsigned>(view->seq());
+        end["parentHash"] = to_string(view->header().parentHash);
+        end["entryCount"] = static_cast<unsigned>(count);
+        return writeAllOrDisconnect(client, json::to_string(end) + "\n");
+    }
+
     void
     run(std::stop_token stop)
     {
@@ -327,23 +546,35 @@ private:
                 client = ::accept4(server, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
                 if (client < 0)
                     continue;
+                auto const subscription = readSubscription(client);
+                Snapshot initial;
+                std::uint64_t initialRevision = 0;
                 {
                     std::lock_guard const lock(mutex_);
                     pending_.clear();
                     disconnect_.store(false, std::memory_order_release);
+                    initial = latest_;
+                    initialRevision = revision_;
+                    connected_.store(true, std::memory_order_release);
                 }
-                // No snapshot barrier exists yet. Clients MUST keep shadow
-                // mode and fetch a synchronized snapshot before trusting data.
-                if (!writeAllOrDisconnect(
+                // Initial snapshot and its revision are captured atomically
+                // against every subsequent enqueue. Never unlock the receive
+                // stream for this subscriber until its complete baseline
+                // is sent on the same ordered socket.
+                bool ok = false;
+                if (subscription.requested)
+                    ok = writeSnapshot(
+                        client, initial, initialRevision, subscription.pairs);
+                else
+                    ok = writeAllOrDisconnect(
                         client,
-                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}"
-                        "\n"))
+                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}\n");
+                if (!ok)
                 {
+                    connected_.store(false, std::memory_order_release);
                     ::close(client);
                     client = -1;
-                    continue;
                 }
-                connected_.store(true, std::memory_order_release);
                 continue;
             }
 
