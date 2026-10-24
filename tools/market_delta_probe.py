@@ -41,8 +41,8 @@ def observe(path: str, seconds: float) -> int:
                 errors += 1
                 print("FRAME_TOO_LARGE", file=sys.stderr)
                 break
-            while b"\\n" in buffer:
-                frame, buffer = buffer.split(b"\\n", 1)
+            while b"\n" in buffer:
+                frame, buffer = buffer.split(b"\n", 1)
                 now = time.monotonic()
                 try:
                     message = json.loads(frame)
@@ -50,46 +50,46 @@ def observe(path: str, seconds: float) -> int:
                     errors += 1
                     print(f"INVALID_FRAME: {exc}", file=sys.stderr)
                     return 1
-            if message.get("schema") != 1:
-                errors += 1
-                print(f"INVALID_SCHEMA: {message.get('schema')}", file=sys.stderr)
-                break
-            kind = message.get("kind")
-            counts[kind] += 1
-            if kind in ("resync_required", "ledger_reset"):
-                last_revision = None
-                last_epoch = None
-                print(f"{now - start:7.3f}s {kind}: must resync")
-                continue
-            if kind != "market_delta":
-                errors += 1
-                print(f"INVALID_KIND: {kind}", file=sys.stderr)
-                break
-            try:
-                revision = int(message["revision"])
-            except (ValueError, TypeError, KeyError):
-                errors += 1
-                print("INVALID_REVISION", file=sys.stderr)
-                break
-            if last_revision is not None and revision != last_revision + 1:
-                errors += 1
-                print(f"REVISION_GAP: {last_revision} -> {revision}", file=sys.stderr)
-            epoch = (message.get("parentHash"), message.get("openLedger"))
-            if last_epoch is not None and epoch != last_epoch:
-                errors += 1
-                print(f"UNSIGNALED_EPOCH: {last_epoch} -> {epoch}", file=sys.stderr)
-            last_revision, last_epoch = revision, epoch
-            changes = message.get("changes")
-            if not isinstance(changes, list):
-                errors += 1
-                print("INVALID_CHANGES", file=sys.stderr)
-                break
-            counts["entries"] += len(changes)
-            if counts["market_delta"] % 50 == 1:
-                print(
-                    f"{now - start:7.3f}s ledger={epoch[1]} revision={revision}"
-                    f" changes={len(changes)} queued_us={message.get('queueUs')}"
-                )
+                if message.get("schema") != 1:
+                    errors += 1
+                    print(f"INVALID_SCHEMA: {message.get('schema')}", file=sys.stderr)
+                    break
+                kind = message.get("kind")
+                counts[kind] += 1
+                if kind in ("resync_required", "ledger_reset"):
+                    last_revision = None
+                    last_epoch = None
+                    print(f"{now - start:7.3f}s {kind}: must resync")
+                    continue
+                if kind != "market_delta":
+                    errors += 1
+                    print(f"INVALID_KIND: {kind}", file=sys.stderr)
+                    break
+                try:
+                    revision = int(message["revision"])
+                except (ValueError, TypeError, KeyError):
+                    errors += 1
+                    print("INVALID_REVISION", file=sys.stderr)
+                    break
+                if last_revision is not None and revision != last_revision + 1:
+                    errors += 1
+                    print(f"REVISION_GAP: {last_revision} -> {revision}", file=sys.stderr)
+                epoch = (message.get("parentHash"), message.get("openLedger"))
+                if last_epoch is not None and epoch != last_epoch:
+                    errors += 1
+                    print(f"UNSIGNALED_EPOCH: {last_epoch} -> {epoch}", file=sys.stderr)
+                last_revision, last_epoch = revision, epoch
+                changes = message.get("changes")
+                if not isinstance(changes, list):
+                    errors += 1
+                    print("INVALID_CHANGES", file=sys.stderr)
+                    break
+                counts["entries"] += len(changes)
+                if counts["market_delta"] % 50 == 1:
+                    print(
+                        f"{now - start:7.3f}s ledger={epoch[1]} revision={revision}"
+                        f" changes={len(changes)} queued_us={message.get('queueUs')}"
+                    )
     print("Counts:", dict(counts), "errors:", errors)
     return 1 if errors else 0
 
