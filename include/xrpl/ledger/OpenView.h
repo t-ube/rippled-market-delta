@@ -255,8 +255,8 @@ public:
         const
     {
         items_.visitDiffKeys(previous.items_, [&](uint256 const& key) {
-            auto const before = previous.read(keylet::unchecked(key));
-            auto const after = read(keylet::unchecked(key));
+            auto const before = previous.read(Keylet{ltANY, key});
+            auto const after = read(Keylet{ltANY, key});
             if ((!before && !after) || (before && after && *before == *after))
                 return;
             visit(key, before, after);
