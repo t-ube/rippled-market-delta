@@ -88,7 +88,7 @@ public:
     }
 
 private:
-    enum class Kind { Delta, Reset, Gap };
+    enum class Kind { Delta, Reset };
     struct Event
     {
         Kind kind;
@@ -127,7 +127,8 @@ private:
     void
     enqueue(Kind kind, Snapshot before, Snapshot after) noexcept
     {
-        if (!connected_.load(std::memory_order_acquire))
+        if (!connected_.load(std::memory_order_acquire) ||
+            disconnect_.load(std::memory_order_acquire))
             return;
         try
         {
@@ -136,9 +137,9 @@ private:
             auto const revision = ++revision_;
             if (pending_.size() >= maxQueued_)
             {
-                // Never silently lose a revision, even if the consumer is slow.
-                pending_.clear();
-                pending_.push_back({Kind::Gap, revision, nullptr, std::move(after), now});
+                // The worker owns snapshot destruction. Never clear a queue
+                // of large OpenViews on the ledger application thread.
+                disconnect_.store(true, std::memory_order_release);
                 ready_.notify_one();
                 return;
             }
@@ -178,16 +179,12 @@ private:
         json::Value out(json::ValueType::Object);
         out["schema"] = 1;
         out["revision"] = std::to_string(event.revision);
-        out["kind"] = event.kind == Kind::Reset   ? "ledger_reset"
-            : event.kind == Kind::Gap             ? "resync_required"
-                                                  : "market_delta";
+        out["kind"] = event.kind == Kind::Reset ? "ledger_reset" : "market_delta";
         if (event.after)
         {
             out["openLedger"] = static_cast<unsigned>(event.after->seq());
             out["parentHash"] = to_string(event.after->header().parentHash);
         }
-        if (event.kind == Kind::Gap)
-            out["reason"] = "queue_overflow";
         out["queueUs"] = std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - event.queued).count());
 
@@ -321,6 +318,10 @@ private:
                 {
                     pending_.clear();
                     lock.unlock();
+                    (void)writeAllOrDisconnect(
+                        client,
+                        "{\"schema\":1,\"kind\":\"resync_required\","
+                        "\"reason\":\"queue_overflow_or_error\"}\n");
                     ::close(client);
                     client = -1;
                     continue;
