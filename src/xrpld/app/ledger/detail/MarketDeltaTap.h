@@ -535,6 +535,7 @@ private:
         }
 
         int client = -1;
+        std::set<std::string> subscribedPairs;
         while (!stop.stop_requested())
         {
             if (client < 0)
@@ -547,6 +548,7 @@ private:
                 if (client < 0)
                     continue;
                 auto const subscription = readSubscription(client);
+                subscribedPairs = subscription.pairs;
                 Snapshot initial;
                 std::uint64_t initialRevision = 0;
                 {
@@ -622,6 +624,19 @@ private:
 
             try
             {
+                // A new validated ledger changes the entire base of the
+                // OpenView. A reset has no valid incremental delta relative
+                // to the previous parent ledger. Re-anchor the subscriber
+                // with a complete atomic snapshot before any later updates.
+                if (event.kind == Kind::Reset && !subscribedPairs.empty())
+                {
+                    if (!writeSnapshot(client, event.after, event.revision, subscribedPairs))
+                    {
+                        ::close(client);
+                        client = -1;
+                    }
+                    continue;
+                }
                 auto const frame = encode(event);
                 if (frame.size() > 16 * 1024 * 1024 || !writeAllOrDisconnect(client, frame))
                 {
