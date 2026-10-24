@@ -1,6 +1,6 @@
 # Open Market Delta: initial PoC contract (XRPLF rippled 3.4.1)
 
-> Status: **design / shadow-mode only**. No daemon hook, stream endpoint, CI build, or deployment controller has been implemented by this document. Do not use these events to make live trading decisions until the verification gates below pass.
+> Status: **shadow-mode implementation in progress**. A Linux-only, disabled-by-default Unix socket stream and probe are implemented. There is no synchronized snapshot barrier, GitHub CI result, deployment controller, or bot integration yet. **Never use these events for live trading decisions**.
 
 ## Baseline
 
@@ -20,20 +20,19 @@
 
 Preferred initial transport: local Unix domain socket with a bounded, nonblocking producer queue. Never expose the feed publicly. Queue saturation must not block consensus/application; it must publish a gap/resync marker, not silently lose changes.
 
-Event schema, provisional:
+Event schema (current shadow prototype, with revision as a decimal string):
 
 ```json
 {
   "schema": 1,
   "kind": "market_delta",
-  "epoch": "validated-parent-hash-or-equivalent",
+  "parentHash": "validated-parent-hash",
   "openLedger": 107866062,
-  "revision": 123,
-  "txHash": "...",
+  "revision": "123",
+  "queueUs": "1400",
   "changes": [
     {
-      "ledgerIndex": "...",
-      "entryType": "Offer",
+      "index": "...",
       "action": "modified",
       "before": {},
       "after": {}
@@ -42,12 +41,50 @@ Event schema, provisional:
 }
 ```
 
-- `revision` is strictly monotonic within an `epoch`; a new open-ledger parent begins a new epoch. Replays/resets/failed publishes must cause a resync marker.
+- `revision` is process-monotonic for queued notifications. `ledger_reset` marks each parent/epoch transition; `resync_required` marks a new subscriber, overrun, or encoding failure. At present notifications group every change within one published `OpenLedger::modify()`; they do **not** claim a unique `txHash`.
 - Emit **only committed open-view changes**. Do not emit discarded Batch inner mutations, failed speculative applications, dry runs, or consensus replay as live market commits.
 - Include `Offer`, `AMM`, and the account/trust-line changes needed to reconstruct AMM reserves. A change to AMM trading fees can invalidate a market even without an Offer update.
 - The producer must copy/serialize data before the underlying view can be mutated or released. No holding view locks during socket I/O.
 - A subscriber must explicitly synchronize a full starting market state and an epoch/revision watermark. A raw delta feed alone cannot initialize a correct order book.
 - A gap, reorder, stale epoch, unsupported ledger object, or reconnect makes that part of the market **unknown**. The bot must fall back to RPC and reject stale candidates.
+
+## Current implementation (shadow-only)
+
+**Scope: four C++ files**, plus this documentation and a Python probe.
+
+- `src/xrpld/app/ledger/detail/OpenLedger.cpp` queues a before/after open-view pair **only when `modify()` successfully publishes it**. Ledger `accept()` queues a reset. The Batch inner state does not leak until the enclosing published view is committed.
+- `include/xrpl/ledger/detail/RawStateTable.h` exposes the union of locally modified ledger keys. `include/xrpl/ledger/OpenView.h` compares these keys in two immutable snapshots, so the worker does not sweep the entire account tree.
+- `src/xrpld/app/ledger/detail/MarketDeltaTap.h` is a header-only optional Unix socket publisher. At most 32 snapshot events are queued; overflowing forces a `resync_required` event. Socket writing, ledger entry JSON serialization, and diff construction occur on a worker thread. Missing consumer means **no diff work**. The socket is owner-only (0600). It does not modify transaction application, consensus, ledger serialization, or signatures.
+- Only changed `Offer`, `AMM`, `AccountRoot`, and `RippleState` objects are emitted. Market-affecting data not represented by these four entry types must be handled before trading use.
+- The endpoint is **disabled by default**. This first stream does not provide a snapshot barrier or guarantee an initial complete book. A connection begins with `resync_required`; no trading client should treat its later deltas as fully initialized.
+- Linux support only in this prototype. Build and integration correctness need verification in CI and on a **non-production** node first.
+
+### Local shadow test
+
+Build a test image from this branch and run it with the environment variable and a restrictive, shared socket directory:
+
+```yaml
+services:
+  xrpld:
+    environment:
+      XRPLD_MARKET_DELTA_SOCKET: /run/market-delta/stream.sock
+    volumes:
+      - ./data/market-delta:/run/market-delta
+```
+
+The parent directory must already exist and be writable by xrpld. Do not change the production node image while experimenting. The socket is local only; no TCP port is opened.
+
+After starting the **test** node, observe the stream from the host:
+
+```bash
+python3 tools/market_delta_probe.py /opt/xrpl-arb/server/data/market-delta/stream.sock --seconds 60
+```
+
+The observer checks JSON frames, sequence gaps, and epoch transitions. It does **not** establish snapshot consistency or prove XRP profitability. To compare against current-ledger RPC, build an independent shadow consumer with a synchronized snapshot/revision barrier first.
+
+### Deployment and rollback
+
+The planned `./ops/xrpld-forkctl {status|update|rollback}` controller is **not yet implemented**. No GHCR image has been produced by this prototype. Until CI, feed consistency, and rollback are verified, retain the official `xrplf/xrpld:3.4.1` as the LIVE node and preserve the NuDB volume. Never directly change LIVE to this prototype.
 
 ## Deliver in stages
 
