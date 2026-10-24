@@ -109,7 +109,18 @@ private:
     std::jthread worker_;
 
     explicit MarketDeltaTap(std::string path)
-        : path_(std::move(path)), worker_([this](std::stop_token stop) { run(stop); })
+        : path_(std::move(path))
+        , worker_([this](std::stop_token stop) {
+            try
+            {
+                run(stop);
+            }
+            catch (...)
+            {
+                connected_.store(false, std::memory_order_release);
+                std::fprintf(stderr, "market-delta: observer worker stopped unexpectedly\\n");
+            }
+        })
     {
     }
 
@@ -211,7 +222,7 @@ private:
     }
 
     void
-    run(std::stop_token stop) noexcept
+    run(std::stop_token stop)
     {
         sockaddr_un addr{};
         if (path_.size() >= sizeof(addr.sun_path))
@@ -354,7 +365,7 @@ private:
     }
 #else
     void
-    run(std::stop_token) noexcept
+    run(std::stop_token)
     {
     }
 #endif
