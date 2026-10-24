@@ -80,7 +80,10 @@ def observe(path: str, seconds: float) -> int:
                 epoch = (message.get("parentHash"), message.get("openLedger"))
                 if last_epoch is not None and epoch != last_epoch:
                     errors += 1
-                    print(f"UNEXPECTED_EPOCH_CHANGE: {last_epoch} -> {epoch}", file=sys.stderr)
+                    print(
+                        f"UNEXPECTED_EPOCH_CHANGE: {last_epoch} -> {epoch}",
+                        file=sys.stderr,
+                    )
                 last_revision, last_epoch = revision, epoch
                 changes = message.get("changes")
                 if not isinstance(changes, list):
