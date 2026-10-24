@@ -9,6 +9,10 @@ on:
       - feature/open-market-delta-poc
     paths:
       - .github/workflows/market-delta-poc-build.yml
+      - include/xrpl/ledger/**
+      - src/xrpld/app/ledger/**
+      - src/test/ledger/View_test.cpp
+      - conanfile.py
   workflow_dispatch:
 
 permissions:
