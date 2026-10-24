@@ -1,4 +1,4 @@
-# Open Market Delta: initial PoC contract (XRPLF rippled 3.4.1)
+# Open Market Delta: initial PoC contract (XRPLF xrpld 3.4.1)
 
 > Status: **shadow-mode implementation in progress**. A Linux-only, disabled-by-default Unix socket stream and probe are implemented. There is no synchronized snapshot barrier, GitHub CI result, deployment controller, or bot integration yet. **Never use these events for live trading decisions**.
 
