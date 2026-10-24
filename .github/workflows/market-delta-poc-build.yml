@@ -45,25 +45,25 @@ jobs:
       - name: Install required dependencies
         run: |
           conan install \
-            --profile:all ci \
-            --build=missing \
-            --options:host='&:tests=True' \
-            --options:host='&:xrpld=True' \
-            --settings:all build_type=Release \
-            --conf:all tools.build:jobs=2 \
-            --conf:all tools.build:verbosity=quiet \
-            --conf:all tools.compilation:verbosity=quiet \
-            .
+              --profile:all ci \
+              --build=missing \
+              --options:host='&:tests=True' \
+              --options:host='&:xrpld=True' \
+              --settings:all build_type=Release \
+              --conf:all tools.build:jobs=2 \
+              --conf:all tools.build:verbosity=quiet \
+              --conf:all tools.compilation:verbosity=quiet \
+              .
 
       - name: Configure CMake
         run: |
           cmake -S . -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -Dxrpld=ON \
-            -Dtests=ON \
-            -Dwerr=ON \
-            -Drust=OFF
+              -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
+              -DCMAKE_BUILD_TYPE=Release \
+              -Dxrpld=ON \
+              -Dtests=ON \
+              -Dwerr=ON \
+              -Drust=OFF
 
       - name: Compile xrpld
         run: cmake --build build --parallel 2 --target xrpld
