@@ -1073,9 +1073,8 @@ class View_test : public beast::unit_test::Suite
         OpenView unchanged(created);
         std::size_t unchangedCount = 0;
         unchanged.visitChangesSince(
-            created, [&](uint256 const&, SLE::const_pointer, SLE::const_pointer) {
-                ++unchangedCount;
-            });
+            created,
+            [&](uint256 const&, SLE::const_pointer, SLE::const_pointer) { ++unchangedCount; });
         BEAST_EXPECT(unchangedCount == 0);
 
         OpenView modified(created);

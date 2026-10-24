@@ -57,8 +57,7 @@ public:
         auto b = previous.items_.begin();
         while (a != items_.end() || b != previous.items_.end())
         {
-            if (b == previous.items_.end() ||
-                (a != items_.end() && a->first < b->first))
+            if (b == previous.items_.end() || (a != items_.end() && a->first < b->first))
             {
                 visit(a->first);
                 ++a;

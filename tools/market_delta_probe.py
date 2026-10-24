@@ -8,6 +8,7 @@ The server intentionally begins every connection with resync_required.
 This observer verifies framing, monotonically increasing revisions, and
 ledger transitions; it does NOT certify that the data equals an RPC snapshot.
 """
+
 import argparse
 import collections
 import json
@@ -73,11 +74,13 @@ def observe(path: str, seconds: float) -> int:
                     break
                 if last_revision is not None and revision != last_revision + 1:
                     errors += 1
-                    print(f"REVISION_GAP: {last_revision} -> {revision}", file=sys.stderr)
+                    print(
+                        f"REVISION_GAP: {last_revision} -> {revision}", file=sys.stderr
+                    )
                 epoch = (message.get("parentHash"), message.get("openLedger"))
                 if last_epoch is not None and epoch != last_epoch:
                     errors += 1
-                    print(f"UNSIGNALED_EPOCH: {last_epoch} -> {epoch}", file=sys.stderr)
+                    print(f"UNEXPECTED_EPOCH_CHANGE: {last_epoch} -> {epoch}", file=sys.stderr)
                 last_revision, last_epoch = revision, epoch
                 changes = message.get("changes")
                 if not isinstance(changes, list):

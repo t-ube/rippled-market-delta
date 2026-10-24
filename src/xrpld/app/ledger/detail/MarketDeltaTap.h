@@ -3,15 +3,15 @@
 // Shadow-only local stream for committed open-ledger state changes.
 // Disabled unless XRPLD_MARKET_DELTA_SOCKET is set. No socket I/O or JSON
 // serialization is done on the ledger application thread.
-#include <xrpl/ledger/OpenView.h>
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
+#include <xrpl/ledger/OpenView.h>
 #include <xrpl/protocol/LedgerFormats.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,12 +25,14 @@
 #include <utility>
 
 #if defined(__linux__)
-#include <cerrno>
-#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+
+#include <poll.h>
 #include <unistd.h>
+
+#include <cerrno>
 #endif
 
 namespace xrpl {
@@ -109,8 +111,7 @@ private:
     std::jthread worker_;
 
     explicit MarketDeltaTap(std::string path)
-        : path_(std::move(path))
-        , worker_([this](std::stop_token stop) {
+        : path_(std::move(path)), worker_([this](std::stop_token stop) {
             try
             {
                 run(stop);
@@ -143,8 +144,7 @@ private:
                 ready_.notify_one();
                 return;
             }
-            pending_.push_back(
-                {kind, revision, std::move(before), std::move(after), now});
+            pending_.push_back({kind, revision, std::move(before), std::move(after), now});
             ready_.notify_one();
         }
         catch (...)
@@ -185,8 +185,10 @@ private:
             out["openLedger"] = static_cast<unsigned>(event.after->seq());
             out["parentHash"] = to_string(event.after->header().parentHash);
         }
-        out["queueUs"] = std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - event.queued).count());
+        out["queueUs"] = std::to_string(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - event.queued)
+                .count());
 
         if (event.kind == Kind::Delta && event.before && event.after)
         {
@@ -235,7 +237,7 @@ private:
         addr.sun_family = AF_UNIX;
 
         // Refuse to replace a regular file or someone else's socket.
-        struct stat existing {};
+        struct stat existing{};
         if (::lstat(path_.c_str(), &existing) == 0)
         {
             if (!S_ISSOCK(existing.st_mode) || existing.st_uid != ::geteuid())
@@ -250,12 +252,11 @@ private:
                 ::close(server);
                 return;
             }
-            int const connected = ::connect(
-                probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            int const connected =
+                ::connect(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
             int const connectErrno = errno;
             ::close(probe);
-            if (connected == 0 || connectErrno != ECONNREFUSED ||
-                ::unlink(path_.c_str()) != 0)
+            if (connected == 0 || connectErrno != ECONNREFUSED || ::unlink(path_.c_str()) != 0)
             {
                 ::close(server);
                 return;
@@ -268,8 +269,7 @@ private:
         }
 
         if (::bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
-            ::chmod(path_.c_str(), S_IRUSR | S_IWUSR) != 0 ||
-            ::listen(server, 1) != 0)
+            ::chmod(path_.c_str(), S_IRUSR | S_IWUSR) != 0 || ::listen(server, 1) != 0)
         {
             std::fprintf(stderr, "market-delta: unable to bind local socket\n");
             ::close(server);
@@ -297,7 +297,8 @@ private:
                 // mode and fetch a synchronized snapshot before trusting data.
                 if (!writeAllOrDisconnect(
                         client,
-                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}\n"))
+                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"new_subscriber\"}"
+                        "\n"))
                 {
                     ::close(client);
                     client = -1;
@@ -345,7 +346,8 @@ private:
                 // A failure to build the delta invalidates continuity.
                 if (!writeAllOrDisconnect(
                         client,
-                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"encode_error\"}\n"))
+                        "{\"schema\":1,\"kind\":\"resync_required\",\"reason\":\"encode_error\"}"
+                        "\n"))
                 {
                     ::close(client);
                     client = -1;
