@@ -1,4 +1,5 @@
 #include <xrpld/app/ledger/OpenLedger.h>
+#include <xrpld/app/ledger/detail/MarketDeltaTap.h>
 
 #include <xrpld/app/main/Application.h>
 #include <xrpld/app/misc/TxQ.h>
@@ -64,12 +65,17 @@ bool
 OpenLedger::modify(modify_type const& f)
 {
     std::scoped_lock const lock1(modifyMutex_);
+    auto previous = current_;
     auto next = std::make_shared<OpenView>(*current_);
     auto const changed = f(*next, j_);
     if (changed)
     {
         std::scoped_lock const lock2(currentMutex_);
         current_ = std::move(next);
+        // Emit only after the complete proposed view has been published.
+        // This avoids leaking rolled-back tfAllOrNothing Batch inner effects.
+        if (auto* tap = MarketDeltaTap::instance())
+            tap->modified(std::move(previous), current_);
     }
     return changed;
 }
@@ -157,6 +163,9 @@ OpenLedger::accept(
     // Switch to the new open view
     std::scoped_lock const lock2(currentMutex_);
     current_ = std::move(next);
+    // Ledger transitions invalidate any pending market-delta epoch.
+    if (auto* tap = MarketDeltaTap::instance())
+        tap->reset(current_);
 }
 
 //------------------------------------------------------------------------------
