@@ -4,9 +4,12 @@
 // Disabled unless XRPLD_MARKET_DELTA_SOCKET is set. No socket I/O or JSON
 // serialization is done on the ledger application thread.
 #include <xrpl/json/json_reader.h>
+#include <xrpl/ledger/BookDirs.h>
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
 #include <xrpl/ledger/OpenView.h>
+#include <xrpl/protocol/Book.h>
+#include <xrpl/protocol/Indexes.h>
 #include <xrpl/protocol/LedgerFormats.h>
 
 #include <atomic>
@@ -232,9 +235,12 @@ private:
     // AF_UNIX SOCK_STREAM can make partial writes, even without EAGAIN.
     // Bound send latency so a slow reader never stalls this observer indefinitely.
     static bool
-    writeAllOrDisconnect(int fd, std::string const& line) noexcept
+    writeAllOrDisconnect(
+        int fd,
+        std::string const& line,
+        std::chrono::milliseconds budget = std::chrono::milliseconds(100)) noexcept
     {
-        auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        auto const deadline = std::chrono::steady_clock::now() + budget;
         std::size_t sent = 0;
         while (sent < line.size())
         {
@@ -351,10 +357,32 @@ private:
         return sub;
     }
 
-    // Send a complete, immutable initial market view before ANY queued
-    // updates. The view/revision capture and enqueue share a single mutex.
-    // Bounded chunks ensure no oversized NDJSON frames; a failed snapshot
-    // invalidates the client rather than silently creating a partial view.
+    static bool
+    parseAsset(std::string const& name, Issue& out)
+    {
+        if (name == "XRP")
+        {
+            out = xrpIssue();
+            return true;
+        }
+        auto const dot = name.find('.');
+        if (dot == std::string::npos || name.find('.', dot + 1) != std::string::npos)
+            return false;
+        Currency currency;
+        if (!toCurrency(currency, name.substr(0, dot)) || isXRP(currency) ||
+            currency == badCurrency())
+            return false;
+        auto const account = parseBase58<AccountID>(name.substr(dot + 1));
+        if (!account || *account == noAccount() || *account == xrpAccount())
+            return false;
+        out = Issue{currency, *account};
+        return true;
+    }
+
+    // Read just the subscribed books and keyed funding entries; never walk
+    // view->sles (the validated SHAMap may have tens of millions of nodes).
+    // BookDirs visits both directions in quality order and includes inherited
+    // validated offers, with no book-depth truncation.
     static bool
     writeSnapshot(
         int client,
@@ -368,6 +396,7 @@ private:
                 stderr, "market-delta: snapshot unavailable (view or subscription empty)\n");
             return false;
         }
+        auto const started = std::chrono::steady_clock::now();
         json::Value begin(json::ValueType::Object);
         begin["schema"] = 1;
         begin["kind"] = "snapshot_begin";
@@ -375,24 +404,19 @@ private:
         begin["openLedger"] = static_cast<unsigned>(view->seq());
         begin["parentHash"] = to_string(view->header().parentHash);
         begin["pairCount"] = static_cast<unsigned>(pairs.size());
-        if (!writeAllOrDisconnect(client, json::to_string(begin) + "\n"))
+        constexpr auto kSnapshotSendBudget = std::chrono::milliseconds(2000);
+        if (!writeAllOrDisconnect(client, json::to_string(begin) + "\n", kSnapshotSendBudget))
         {
             std::fprintf(stderr, "market-delta: snapshot_begin send failed\n");
             return false;
         }
-        auto const started = std::chrono::steady_clock::now();
 
         json::Value entries(json::ValueType::Array);
-        std::set<std::string> owners;
-        std::set<std::string> assets;
+        std::set<uint256> emitted;
+        std::set<AccountID> accounts;
+        std::set<std::pair<AccountID, Issue>> trustLines;
         std::size_t count = 0;
         std::size_t bufferedBytes = 0;
-        for (auto const& pair : pairs)
-        {
-            auto const sep = pair.find('|');
-            assets.insert(pair.substr(0, sep));
-            assets.insert(pair.substr(sep + 1));
-        }
         auto flush = [&] {
             if (entries.size() == 0)
                 return true;
@@ -403,12 +427,15 @@ private:
             part["entries"] = std::move(entries);
             entries = json::Value(json::ValueType::Array);
             bufferedBytes = 0;
-            return writeAllOrDisconnect(client, json::to_string(part) + "\n");
+            return writeAllOrDisconnect(
+                client, json::to_string(part) + "\n", kSnapshotSendBudget);
         };
-        auto add = [&](SLE::const_pointer const& sle, json::Value const& data) {
+        auto add = [&](SLE::const_pointer const& sle) {
+            if (!sle || !emitted.insert(sle->key()).second)
+                return true;
             json::Value item(json::ValueType::Object);
             item["index"] = to_string(sle->key());
-            item["after"] = data;
+            item["after"] = sle->getJson();
             auto const bytes = json::to_string(item).size();
             if (bufferedBytes + bytes > 128 * 1024 && !flush())
                 return false;
@@ -417,59 +444,80 @@ private:
             ++count;
             return true;
         };
-        // First pass: all Offers and AMMs for the tracked pairs; no book
-        // depth truncation, including all inherited validated-ledger entries.
-        for (auto const& sle : view->sles)
-        {
-            if (!sle || (sle->getType() != ltOFFER && sle->getType() != ltAMM))
-                continue;
-            auto const data = sle->getJson();
-            auto const pair = sle->getType() == ltOFFER
-                ? pairKey(assetKey(data["TakerPays"]), assetKey(data["TakerGets"]))
-                : pairKey(assetKey(data["Asset"]), assetKey(data["Asset2"]));
-            if (!pairs.contains(pair))
-                continue;
-            if (data["Account"].isString())
-                owners.insert(data["Account"].asString());
-            if (!add(sle, data))
+        auto funding = [&](SLE::const_pointer const& sle, Issue const& sold) {
+            if (!sle)
                 return false;
-        }
-        // Include issuer settings (e.g. TransferRate) and all seller/AMM
-        // account balances required to price funds in this same revision.
-        for (auto const& asset : assets)
-        {
-            auto const sep = asset.find('.');
-            if (sep != std::string::npos)
-                owners.insert(asset.substr(sep + 1));
-        }
-        for (auto const& sle : view->sles)
-        {
-            if (!sle || (sle->getType() != ltACCOUNT_ROOT && sle->getType() != ltRIPPLE_STATE))
-                continue;
             auto const data = sle->getJson();
-            if (sle->getType() == ltACCOUNT_ROOT)
-            {
-                if (!data["Account"].isString() || !owners.contains(data["Account"].asString()))
-                    continue;
-            }
-            else
-            {
-                auto const& low = data["LowLimit"];
-                auto const& high = data["HighLimit"];
-                if (!low.isObject() || !high.isObject() || !low["issuer"].isString() ||
-                    !high["issuer"].isString() || !low["currency"].isString())
-                    continue;
-                auto const l = low["issuer"].asString();
-                auto const h = high["issuer"].asString();
-                auto const cur = low["currency"].asString();
-                if (!owners.contains(l) && !owners.contains(h))
-                    continue;
-                if (!assets.contains(cur + "." + l) && !assets.contains(cur + "." + h))
-                    continue;
-            }
-            if (!add(sle, data))
+            if (!data["Account"].isString())
                 return false;
+            auto const owner = parseBase58<AccountID>(data["Account"].asString());
+            if (!owner)
+                return false;
+            accounts.insert(*owner);
+            if (!isXRP(sold) && *owner != sold.account)
+                trustLines.emplace(*owner, sold);
+            return true;
+        };
+
+        // One keyed AMM read and two quality-ordered book walks per pair.
+        // All issuer AccountRoots are included for TransferRate and flags.
+        for (auto const& pair : pairs)
+        {
+            auto const sep = pair.find('|');
+            if (sep == std::string::npos)
+                return false;
+            Issue left;
+            Issue right;
+            if (!parseAsset(pair.substr(0, sep), left) ||
+                !parseAsset(pair.substr(sep + 1), right) || left == right)
+            {
+                std::fprintf(stderr, "market-delta: invalid snapshot asset pair\n");
+                return false;
+            }
+            if (!isXRP(left))
+                accounts.insert(left.account);
+            if (!isXRP(right))
+                accounts.insert(right.account);
+
+            for (auto const& book : {Book{left, right, std::nullopt},
+                                     Book{right, left, std::nullopt}})
+            {
+                for (auto const& offer : BookDirs(*view, book))
+                {
+                    if (!offer)
+                        continue;
+                    Issue const& sold = book.out.get<Issue>();
+                    if (!funding(offer, sold) || !add(offer))
+                        return false;
+                }
+            }
+            if (auto const amm = view->read(keylet::amm(left, right)))
+            {
+                auto const data = amm->getJson();
+                if (!data["Account"].isString())
+                    return false;
+                auto const owner = parseBase58<AccountID>(data["Account"].asString());
+                if (!owner)
+                    return false;
+                accounts.insert(*owner);
+                if (!isXRP(left) && *owner != left.account)
+                    trustLines.emplace(*owner, left);
+                if (!isXRP(right) && *owner != right.account)
+                    trustLines.emplace(*owner, right);
+                if (!add(amm))
+                    return false;
+            }
         }
+
+        // A Book/AMM owner is queried only for the issue it sells/holds.
+        // This avoids the O(owners × all assets) cross product.
+        for (auto const& account : accounts)
+            if (!add(view->read(keylet::account(account))))
+                return false;
+        for (auto const& [owner, issue] : trustLines)
+            if (!add(view->read(keylet::trustLine(owner, issue))))
+                return false;
+
         if (!flush())
             return false;
         json::Value end(json::ValueType::Object);
@@ -479,14 +527,16 @@ private:
         end["openLedger"] = static_cast<unsigned>(view->seq());
         end["parentHash"] = to_string(view->header().parentHash);
         end["entryCount"] = static_cast<unsigned>(count);
-        auto const ok = writeAllOrDisconnect(client, json::to_string(end) + "\n");
+        auto const ok =
+            writeAllOrDisconnect(client, json::to_string(end) + "\n", kSnapshotSendBudget);
         auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now() - started)
                                  .count();
         std::fprintf(
             stderr,
-            "market-delta: snapshot_end open=%u entries=%zu ms=%lld ok=%d\n",
+            "market-delta: snapshot_end open=%u pairs=%zu entries=%zu ms=%lld ok=%d\n",
             static_cast<unsigned>(view->seq()),
+            pairs.size(),
             count,
             static_cast<long long>(elapsed),
             static_cast<int>(ok));
@@ -572,12 +622,16 @@ private:
                 Snapshot initial;
                 std::uint64_t initialRevision = 0;
                 {
-                    std::lock_guard const lock(mutex_);
-                    pending_.clear();
-                    disconnect_.store(false, std::memory_order_release);
-                    initial = latest_;
-                    initialRevision = revision_;
-                    connected_.store(true, std::memory_order_release);
+                    std::deque<Event> retired;
+                    {
+                        std::lock_guard const lock(mutex_);
+                        retired.swap(pending_);
+                        disconnect_.store(false, std::memory_order_release);
+                        initial = latest_;
+                        initialRevision = revision_;
+                        connected_.store(true, std::memory_order_release);
+                    }
+                    // Drop potentially large snapshots outside the ledger mutex.
                 }
                 // Initial snapshot and its revision are captured atomically
                 // against every subsequent enqueue. Never unlock the receive
@@ -609,8 +663,10 @@ private:
                 });
                 if (disconnect_.load(std::memory_order_acquire))
                 {
-                    pending_.clear();
+                    std::deque<Event> retired;
+                    retired.swap(pending_);
                     lock.unlock();
+                    retired.clear();  // Snapshot destruction must not block enqueue().
                     (void)writeAllOrDisconnect(
                         client,
                         "{\"schema\":1,\"kind\":\"resync_required\","
