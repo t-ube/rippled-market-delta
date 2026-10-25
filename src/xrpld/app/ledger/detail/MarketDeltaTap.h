@@ -341,7 +341,8 @@ private:
             if (!p.isString() || p.asString().size() > 192 ||
                 p.asString().find('|') == std::string::npos)
             {
-                std::fprintf(stderr, "market-delta: invalid subscription pair (length or separator)\n");
+                std::fprintf(
+                    stderr, "market-delta: invalid subscription pair (length or separator)\n");
                 sub.pairs.clear();
                 return sub;
             }
@@ -363,7 +364,8 @@ private:
     {
         if (!view || pairs.empty())
         {
-            std::fprintf(stderr, "market-delta: snapshot unavailable (view or subscription empty)\n");
+            std::fprintf(
+                stderr, "market-delta: snapshot unavailable (view or subscription empty)\n");
             return false;
         }
         json::Value begin(json::ValueType::Object);
@@ -481,9 +483,13 @@ private:
         auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now() - started)
                                  .count();
-        std::fprintf(stderr, "market-delta: snapshot_end open=%u entries=%zu ms=%lld ok=%d\n",
-                     static_cast<unsigned>(view->seq()), count,
-                     static_cast<long long>(elapsed), static_cast<int>(ok));
+        std::fprintf(
+            stderr,
+            "market-delta: snapshot_end open=%u entries=%zu ms=%lld ok=%d\n",
+            static_cast<unsigned>(view->seq()),
+            count,
+            static_cast<long long>(elapsed),
+            static_cast<int>(ok));
         return ok;
     }
 
@@ -558,8 +564,11 @@ private:
                     continue;
                 auto const subscription = readSubscription(client);
                 subscribedPairs = subscription.pairs;
-                std::fprintf(stderr, "market-delta: subscriber request=%d pairs=%zu\n",
-                             static_cast<int>(subscription.requested), subscribedPairs.size());
+                std::fprintf(
+                    stderr,
+                    "market-delta: subscriber request=%d pairs=%zu\n",
+                    static_cast<int>(subscription.requested),
+                    subscribedPairs.size());
                 Snapshot initial;
                 std::uint64_t initialRevision = 0;
                 {
