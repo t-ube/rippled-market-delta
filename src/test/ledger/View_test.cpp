@@ -1137,14 +1137,10 @@ class View_test : public beast::unit_test::Suite
             ++offers;
         }
         BEAST_EXPECT(offers == 1);
-        BEAST_EXPECT(
-            view->read(keylet::account(maker.id())) != nullptr);
-        BEAST_EXPECT(
-            view->read(keylet::account(issuer.id())) != nullptr);
-        BEAST_EXPECT(
-            view->read(keylet::trustLine(maker.id(), usd.issue())) != nullptr);
-        BEAST_EXPECT(
-            !view->read(keylet::amm(usd.issue(), xrpIssue())));
+        BEAST_EXPECT(view->read(keylet::account(maker.id())) != nullptr);
+        BEAST_EXPECT(view->read(keylet::account(issuer.id())) != nullptr);
+        BEAST_EXPECT(view->read(keylet::trustLine(maker.id(), usd.issue())) != nullptr);
+        BEAST_EXPECT(!view->read(keylet::amm(usd.issue(), xrpIssue())));
     }
 
     void
