@@ -47,6 +47,8 @@ private:
     std::mutex mutable modifyMutex_;
     std::mutex mutable currentMutex_;
     std::shared_ptr<OpenView const> current_;
+    // Keep the exact validated base used to construct the current OpenView.
+    std::shared_ptr<Ledger const> marketDeltaBase_;
 
 public:
     /**
