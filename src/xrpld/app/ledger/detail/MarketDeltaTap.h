@@ -315,10 +315,7 @@ private:
     // subscribed pairs, may be sent in subsequent frames. Newly observed
     // market makers gain their unchanged funding entries in the SAME frame.
     static std::string
-    encodeScoped(
-        Event const& event,
-        std::set<std::string> const& pairs,
-        std::set<uint256>& watched)
+    encodeScoped(Event const& event, std::set<std::string> const& pairs, std::set<uint256>& watched)
     {
         if (!event.before || !event.after || pairs.empty())
             return {};
@@ -388,8 +385,7 @@ private:
             trackKey(keylet::account(maker).key);
             auto addLine = [&](json::Value const& value) {
                 Issue issue;
-                if (parseAsset(assetKey(value), issue) && !isXRP(issue) &&
-                    issue.account != maker)
+                if (parseAsset(assetKey(value), issue) && !isXRP(issue) && issue.account != maker)
                     trackKey(keylet::trustLine(maker, issue).key);
             };
             if (sle->getType() == ltOFFER)
@@ -465,7 +461,8 @@ private:
         if (advance)
             std::fprintf(
                 stderr,
-                "market-delta: ledger_advance open=%u candidates=%zu changes=%zu bytes=%zu watched=%zu\n",
+                "market-delta: ledger_advance open=%u candidates=%zu changes=%zu bytes=%zu "
+                "watched=%zu\n",
                 static_cast<unsigned>(event.after->seq()),
                 keys.size(),
                 emitted,
