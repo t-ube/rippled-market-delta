@@ -43,8 +43,13 @@ OpenLedger::OpenLedger(
     std::shared_ptr<Ledger const> const& ledger,
     CachedSLEs& cache,
     beast::Journal journal)
-    : j_(journal), cache_(cache), current_(create(ledger->rules(), ledger))
+    : j_(journal)
+    , cache_(cache)
+    , current_(create(ledger->rules(), ledger))
+    , marketDeltaBase_(ledger)
 {
+    if (auto* tap = MarketDeltaTap::instance())
+        tap->initialize(current_);
 }
 
 bool
@@ -160,12 +165,16 @@ OpenLedger::accept(
         }
     }
 
-    // Switch to the new open view
+    // Switch to the new open view. The old and new validated bases,
+    // together with the two overlays, are pinned in a bounded observer
+    // event so the diff is computed off the transaction application thread.
     std::scoped_lock const lock2(currentMutex_);
+    auto const previous = current_;
+    auto const previousBase = marketDeltaBase_;
     current_ = std::move(next);
-    // Ledger transitions invalidate any pending market-delta epoch.
+    marketDeltaBase_ = ledger;
     if (auto* tap = MarketDeltaTap::instance())
-        tap->reset(current_);
+        tap->reset(previous, current_, previousBase, ledger);
 }
 
 //------------------------------------------------------------------------------
