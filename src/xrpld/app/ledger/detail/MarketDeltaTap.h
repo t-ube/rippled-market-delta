@@ -4,9 +4,9 @@
 // Disabled unless XRPLD_MARKET_DELTA_SOCKET is set. No socket I/O or JSON
 // serialization is done on the ledger application thread.
 #include <xrpl/json/json_reader.h>
-#include <xrpl/ledger/BookDirs.h>
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
+#include <xrpl/ledger/BookDirs.h>
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/protocol/Book.h>
 #include <xrpl/protocol/Indexes.h>
@@ -427,8 +427,7 @@ private:
             part["entries"] = std::move(entries);
             entries = json::Value(json::ValueType::Array);
             bufferedBytes = 0;
-            return writeAllOrDisconnect(
-                client, json::to_string(part) + "\n", kSnapshotSendBudget);
+            return writeAllOrDisconnect(client, json::to_string(part) + "\n", kSnapshotSendBudget);
         };
         auto add = [&](SLE::const_pointer const& sle) {
             if (!sle || !emitted.insert(sle->key()).second)
@@ -479,8 +478,8 @@ private:
             if (!isXRP(right))
                 accounts.insert(right.account);
 
-            for (auto const& book : {Book{left, right, std::nullopt},
-                                     Book{right, left, std::nullopt}})
+            for (auto const& book :
+                 {Book{left, right, std::nullopt}, Book{right, left, std::nullopt}})
             {
                 for (auto const& offer : BookDirs(*view, book))
                 {
