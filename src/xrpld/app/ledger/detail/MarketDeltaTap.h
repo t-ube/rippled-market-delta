@@ -309,69 +309,172 @@ private:
         return true;
     }
 
-    // Rebase one open ledger on the next with the union of:
-    //  1. validated state-map differences (SHAMap hashes, not full traversal);
-    //  2. changed overlay keys from both published OpenViews.
-    // Re-read both final views for every candidate key: the new validated
-    // ledger may already contain old pending transactions, or the new open
-    // ledger may reapply transactions with different results.
+    // The initial snapshot establishes the exact set of objects held by
+    // the subscriber. Only changes to those keys, plus offers/AMMs for
+    // subscribed pairs, may be sent in subsequent frames. Newly observed
+    // market makers gain their unchanged funding entries in the SAME frame.
     static std::string
-    encodeAdvance(Event const& event)
+    encodeScoped(
+        Event const& event,
+        std::set<std::string> const& pairs,
+        std::set<uint256>& watched)
     {
-        if (!event.before || !event.after || !event.oldValidated || !event.newValidated)
-            return {};
-        if (event.newValidated->seq() != event.oldValidated->seq() + 1 ||
-            event.after->seq() != event.before->seq() + 1 ||
-            event.after->header().parentHash != event.newValidated->header().hash ||
-            event.before->header().parentHash != event.oldValidated->header().hash ||
-            event.newValidated->header().parentHash != event.oldValidated->header().hash)
+        if (!event.before || !event.after || pairs.empty())
             return {};
 
-        constexpr int kMaxValidatedChanges = 50000;
-        SHAMap::Delta validated;
-        if (!event.newValidated->stateMap().compare(
-                event.oldValidated->stateMap(), validated, kMaxValidatedChanges))
-            return {};
-
+        bool const advance = event.kind == Kind::Reset;
         std::set<uint256> keys;
-        for (auto const& [key, change] : validated)
-            keys.insert(key);
+        if (advance)
+        {
+            if (!event.oldValidated || !event.newValidated ||
+                event.newValidated->seq() != event.oldValidated->seq() + 1 ||
+                event.after->seq() != event.before->seq() + 1 ||
+                event.after->header().parentHash != event.newValidated->header().hash ||
+                event.before->header().parentHash != event.oldValidated->header().hash ||
+                event.newValidated->header().parentHash != event.oldValidated->header().hash)
+                return {};
+
+            constexpr int kMaxValidatedChanges = 50000;
+            SHAMap::Delta validated;
+            if (!event.newValidated->stateMap().compare(
+                    event.oldValidated->stateMap(), validated, kMaxValidatedChanges))
+                return {};
+            for (auto const& [key, change] : validated)
+                keys.insert(key);
+        }
         event.after->visitChangesSince(
             *event.before,
             [&](uint256 const& key, SLE::const_pointer, SLE::const_pointer) { keys.insert(key); });
-        if (keys.size() > static_cast<std::size_t>(kMaxValidatedChanges))
+        if (keys.size() > 50000)
             return {};
 
-        json::Value msg(json::ValueType::Object);
-        msg["schema"] = 1;
-        msg["kind"] = "ledger_advance";
-        msg["revision"] = std::to_string(event.revision);
-        msg["fromOpenLedger"] = static_cast<unsigned>(event.before->seq());
-        msg["fromParentHash"] = to_string(event.before->header().parentHash);
-        msg["openLedger"] = static_cast<unsigned>(event.after->seq());
-        msg["parentHash"] = to_string(event.after->header().parentHash);
-        msg["queueUs"] = std::to_string(
+        json::Value out(json::ValueType::Object);
+        out["schema"] = 1;
+        out["kind"] = advance ? "ledger_advance" : "market_delta";
+        out["revision"] = std::to_string(event.revision);
+        if (event.coalesced != 0)
+        {
+            out["revisionFrom"] = std::to_string(event.firstRevision);
+            out["coalesced"] = std::to_string(event.coalesced);
+        }
+        if (advance)
+        {
+            out["fromOpenLedger"] = static_cast<unsigned>(event.before->seq());
+            out["fromParentHash"] = to_string(event.before->header().parentHash);
+        }
+        out["openLedger"] = static_cast<unsigned>(event.after->seq());
+        out["parentHash"] = to_string(event.after->header().parentHash);
+        out["queueUs"] = std::to_string(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - event.queued)
                 .count());
 
-        json::Value changes(json::ValueType::Array);
+        // First pass discovers newly relevant makers before deciding which
+        // account/trustline state to include. Never omit unchanged balances
+        // just because only the maker's new Offer appeared in the delta.
+        std::set<uint256> newlyWatched;
+        auto trackFunding = [&](SLE::const_pointer const& sle) {
+            if (!sle)
+                return;
+            if (sle->getType() != ltOFFER && sle->getType() != ltAMM)
+                return;
+            auto const data = sle->getJson();
+            if (!data["Account"].isString())
+                return;
+            auto const maker = parseBase58<AccountID>(data["Account"].asString());
+            if (!maker)
+                return;
+            auto trackKey = [&](uint256 const& key) {
+                if (watched.insert(key).second)
+                    newlyWatched.insert(key);
+            };
+            trackKey(keylet::account(*maker).key);
+            auto addLine = [&](json::Value const& value) {
+                Issue issue;
+                if (parseAsset(assetKey(value), issue) && !isXRP(issue) &&
+                    issue.account != *maker)
+                    trackKey(keylet::trustLine(*maker, issue).key);
+            };
+            if (sle->getType() == ltOFFER)
+                addLine(data["TakerGets"]);
+            else
+            {
+                addLine(data["Asset"]);
+                addLine(data["Asset2"]);
+            }
+        };
+
+        // Preserve a stable old watch set for the whole frame. Newly watched
+        // funding keys are inserted as synthetic creates after market changes.
+        std::set<uint256> eligible;
         for (auto const& key : keys)
         {
+            if (watched.contains(key))
+            {
+                eligible.insert(key);
+                continue;
+            }
             auto const before = event.before->read(Keylet{ltANY, key});
             auto const after = event.after->read(Keylet{ltANY, key});
+            auto const matches = [&](SLE::const_pointer const& sle) {
+                if (!sle || (sle->getType() != ltOFFER && sle->getType() != ltAMM))
+                    return false;
+                auto const data = sle->getJson();
+                auto const pair = sle->getType() == ltOFFER
+                    ? pairKey(assetKey(data["TakerPays"]), assetKey(data["TakerGets"]))
+                    : pairKey(assetKey(data["Asset"]), assetKey(data["Asset2"]));
+                return pairs.contains(pair);
+            };
+            if (matches(before) || matches(after))
+            {
+                watched.insert(key);
+                eligible.insert(key);
+                trackFunding(after);
+            }
+        }
+        // Watchers from the baseline also need to discover funding for
+        // a new seller if the Offer's index was already in the baseline.
+        for (auto const& key : eligible)
+        {
+            auto const after = event.after->read(Keylet{ltANY, key});
+            if (after && (after->getType() == ltOFFER || after->getType() == ltAMM))
+                trackFunding(after);
+        }
+
+        json::Value changes(json::ValueType::Array);
+        std::size_t emitted = 0;
+        auto addChange = [&](uint256 const& key, bool synthetic) {
+            auto const after = event.after->read(Keylet{ltANY, key});
+            auto const before =
+                synthetic ? SLE::const_pointer{} : event.before->read(Keylet{ltANY, key});
             if ((!marketEntry(before) && !marketEntry(after)) ||
                 (before && after && *before == *after))
-                continue;
+                return;
             json::Value change(json::ValueType::Object);
             change["index"] = to_string(key);
             change["action"] = !before ? "created" : !after ? "deleted" : "modified";
             change["before"] = before ? before->getJson() : json::Value{};
             change["after"] = after ? after->getJson() : json::Value{};
             changes.append(std::move(change));
-        }
-        msg["changes"] = std::move(changes);
-        return json::to_string(msg) + "\n";
+            ++emitted;
+        };
+        for (auto const& key : eligible)
+            addChange(key, false);
+        for (auto const& key : newlyWatched)
+            if (!eligible.contains(key))
+                addChange(key, true);
+        out["changes"] = std::move(changes);
+        auto frame = json::to_string(out) + "\n";
+        if (advance)
+            std::fprintf(
+                stderr,
+                "market-delta: ledger_advance open=%u candidates=%zu changes=%zu bytes=%zu watched=%zu\n",
+                static_cast<unsigned>(event.after->seq()),
+                keys.size(),
+                emitted,
+                frame.size(),
+                watched.size());
+        return frame;
     }
 
     static std::string
@@ -490,7 +593,8 @@ private:
         int client,
         Snapshot const& view,
         std::uint64_t revision,
-        std::set<std::string> const& pairs)
+        std::set<std::string> const& pairs,
+        std::set<uint256>* watched = nullptr)
     {
         if (!view || pairs.empty())
         {
@@ -515,6 +619,7 @@ private:
 
         json::Value entries(json::ValueType::Array);
         std::set<uint256> emitted;
+        std::set<uint256> missingFundingKeys;
         std::set<AccountID> accounts;
         std::set<std::pair<AccountID, Issue>> trustLines;
         std::size_t count = 0;
@@ -613,11 +718,17 @@ private:
         // A Book/AMM owner is queried only for the issue it sells/holds.
         // This avoids the O(owners × all assets) cross product.
         for (auto const& account : accounts)
+        {
+            missingFundingKeys.insert(keylet::account(account).key);
             if (!add(view->read(keylet::account(account))))
                 return false;
+        }
         for (auto const& [owner, issue] : trustLines)
+        {
+            missingFundingKeys.insert(keylet::trustLine(owner, issue).key);
             if (!add(view->read(keylet::trustLine(owner, issue))))
                 return false;
+        }
 
         if (!flush())
             return false;
@@ -641,6 +752,11 @@ private:
             count,
             static_cast<long long>(elapsed),
             static_cast<int>(ok));
+        if (ok && watched)
+        {
+            watched->swap(emitted);
+            watched->insert(missingFundingKeys.begin(), missingFundingKeys.end());
+        }
         return ok;
     }
 
@@ -702,6 +818,7 @@ private:
 
         int client = -1;
         std::set<std::string> subscribedPairs;
+        std::set<uint256> watched;
         while (!stop.stop_requested())
         {
             if (client < 0)
@@ -715,6 +832,7 @@ private:
                     continue;
                 auto const subscription = readSubscription(client);
                 subscribedPairs = subscription.pairs;
+                watched.clear();
                 std::fprintf(
                     stderr,
                     "market-delta: subscriber request=%d pairs=%zu\n",
@@ -740,7 +858,8 @@ private:
                 // is sent on the same ordered socket.
                 bool ok = false;
                 if (subscription.requested)
-                    ok = writeSnapshot(client, initial, initialRevision, subscription.pairs);
+                    ok = writeSnapshot(
+                        client, initial, initialRevision, subscription.pairs, &watched);
                 else
                     ok = writeAllOrDisconnect(
                         client,
@@ -806,7 +925,7 @@ private:
                 // ledger-reset path. A bounded compare failure revokes trust.
                 if (event.kind == Kind::Reset && !subscribedPairs.empty())
                 {
-                    auto const advance = encodeAdvance(event);
+                    auto const advance = encodeScoped(event, subscribedPairs, watched);
                     if (advance.empty() || advance.size() > 16 * 1024 * 1024 ||
                         !writeAllOrDisconnect(client, advance, std::chrono::milliseconds(2000)))
                     {
@@ -819,7 +938,9 @@ private:
                     }
                     continue;
                 }
-                auto const frame = encode(event);
+                auto const frame = subscribedPairs.empty()
+                    ? encode(event)
+                    : encodeScoped(event, subscribedPairs, watched);
                 if (frame.size() > 16 * 1024 * 1024 || !writeAllOrDisconnect(client, frame))
                 {
                     std::fprintf(
