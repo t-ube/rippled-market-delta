@@ -338,9 +338,10 @@ private:
             return sub;
         for (auto const& p : request["pairs"])
         {
-            if (!p.isString() || p.asString().size() > 120 ||
+            if (!p.isString() || p.asString().size() > 192 ||
                 p.asString().find('|') == std::string::npos)
             {
+                std::fprintf(stderr, "market-delta: invalid subscription pair (length or separator)\n");
                 sub.pairs.clear();
                 return sub;
             }
@@ -361,7 +362,10 @@ private:
         std::set<std::string> const& pairs)
     {
         if (!view || pairs.empty())
+        {
+            std::fprintf(stderr, "market-delta: snapshot unavailable (view or subscription empty)\n");
             return false;
+        }
         json::Value begin(json::ValueType::Object);
         begin["schema"] = 1;
         begin["kind"] = "snapshot_begin";
@@ -370,7 +374,11 @@ private:
         begin["parentHash"] = to_string(view->header().parentHash);
         begin["pairCount"] = static_cast<unsigned>(pairs.size());
         if (!writeAllOrDisconnect(client, json::to_string(begin) + "\n"))
+        {
+            std::fprintf(stderr, "market-delta: snapshot_begin send failed\n");
             return false;
+        }
+        auto const started = std::chrono::steady_clock::now();
 
         json::Value entries(json::ValueType::Array);
         std::set<std::string> owners;
@@ -469,7 +477,14 @@ private:
         end["openLedger"] = static_cast<unsigned>(view->seq());
         end["parentHash"] = to_string(view->header().parentHash);
         end["entryCount"] = static_cast<unsigned>(count);
-        return writeAllOrDisconnect(client, json::to_string(end) + "\n");
+        auto const ok = writeAllOrDisconnect(client, json::to_string(end) + "\n");
+        auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count();
+        std::fprintf(stderr, "market-delta: snapshot_end open=%u entries=%zu ms=%lld ok=%d\n",
+                     static_cast<unsigned>(view->seq()), count,
+                     static_cast<long long>(elapsed), static_cast<int>(ok));
+        return ok;
     }
 
     void
@@ -543,6 +558,8 @@ private:
                     continue;
                 auto const subscription = readSubscription(client);
                 subscribedPairs = subscription.pairs;
+                std::fprintf(stderr, "market-delta: subscriber request=%d pairs=%zu\n",
+                             static_cast<int>(subscription.requested), subscribedPairs.size());
                 Snapshot initial;
                 std::uint64_t initialRevision = 0;
                 {
