@@ -12,6 +12,7 @@
 #include <xrpl/protocol/Book.h>
 #include <xrpl/protocol/Indexes.h>
 #include <xrpl/protocol/LedgerFormats.h>
+#include <xrpl/protocol/SField.h>
 
 #include <atomic>
 #include <chrono>
@@ -378,22 +379,18 @@ private:
                 return;
             if (sle->getType() != ltOFFER && sle->getType() != ltAMM)
                 return;
+            auto const maker = sle->getAccountID(sfAccount);
             auto const data = sle->getJson();
-            if (!data["Account"].isString())
-                return;
-            auto const maker = parseBase58<AccountID>(data["Account"].asString());
-            if (!maker)
-                return;
             auto trackKey = [&](uint256 const& key) {
                 if (watched.insert(key).second)
                     newlyWatched.insert(key);
             };
-            trackKey(keylet::account(*maker).key);
+            trackKey(keylet::account(maker).key);
             auto addLine = [&](json::Value const& value) {
                 Issue issue;
                 if (parseAsset(assetKey(value), issue) && !isXRP(issue) &&
-                    issue.account != *maker)
-                    trackKey(keylet::trustLine(*maker, issue).key);
+                    issue.account != maker)
+                    trackKey(keylet::trustLine(maker, issue).key);
             };
             if (sle->getType() == ltOFFER)
                 addLine(data["TakerGets"]);
@@ -653,15 +650,10 @@ private:
         auto funding = [&](SLE::const_pointer const& sle, Issue const& sold) {
             if (!sle)
                 return false;
-            auto const data = sle->getJson();
-            if (!data["Account"].isString())
-                return false;
-            auto const owner = parseBase58<AccountID>(data["Account"].asString());
-            if (!owner)
-                return false;
-            accounts.insert(*owner);
-            if (!isXRP(sold) && *owner != sold.account)
-                trustLines.emplace(*owner, sold);
+            auto const owner = sle->getAccountID(sfAccount);
+            accounts.insert(owner);
+            if (!isXRP(sold) && owner != sold.account)
+                trustLines.emplace(owner, sold);
             return true;
         };
 
@@ -699,17 +691,12 @@ private:
             }
             if (auto const amm = view->read(keylet::amm(left, right)))
             {
-                auto const data = amm->getJson();
-                if (!data["Account"].isString())
-                    return false;
-                auto const owner = parseBase58<AccountID>(data["Account"].asString());
-                if (!owner)
-                    return false;
-                accounts.insert(*owner);
-                if (!isXRP(left) && *owner != left.account)
-                    trustLines.emplace(*owner, left);
-                if (!isXRP(right) && *owner != right.account)
-                    trustLines.emplace(*owner, right);
+                auto const owner = amm->getAccountID(sfAccount);
+                accounts.insert(owner);
+                if (!isXRP(left) && owner != left.account)
+                    trustLines.emplace(owner, left);
+                if (!isXRP(right) && owner != right.account)
+                    trustLines.emplace(owner, right);
                 if (!add(amm))
                     return false;
             }
