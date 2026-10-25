@@ -318,8 +318,7 @@ private:
     static std::string
     encodeAdvance(Event const& event)
     {
-        if (!event.before || !event.after || !event.oldValidated ||
-            !event.newValidated)
+        if (!event.before || !event.after || !event.oldValidated || !event.newValidated)
             return {};
         if (event.newValidated->seq() != event.oldValidated->seq() + 1 ||
             event.after->seq() != event.before->seq() + 1 ||
@@ -339,9 +338,7 @@ private:
             keys.insert(key);
         event.after->visitChangesSince(
             *event.before,
-            [&](uint256 const& key, SLE::const_pointer, SLE::const_pointer) {
-                keys.insert(key);
-            });
+            [&](uint256 const& key, SLE::const_pointer, SLE::const_pointer) { keys.insert(key); });
         if (keys.size() > static_cast<std::size_t>(kMaxValidatedChanges))
             return {};
 
@@ -811,8 +808,7 @@ private:
                 {
                     auto const advance = encodeAdvance(event);
                     if (advance.empty() || advance.size() > 16 * 1024 * 1024 ||
-                        !writeAllOrDisconnect(
-                            client, advance, std::chrono::milliseconds(2000)))
+                        !writeAllOrDisconnect(client, advance, std::chrono::milliseconds(2000)))
                     {
                         (void)writeAllOrDisconnect(
                             client,
