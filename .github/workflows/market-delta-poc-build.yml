@@ -11,6 +11,7 @@ on:
       - .github/workflows/market-delta-poc-build.yml
       - include/xrpl/ledger/**
       - src/xrpld/app/ledger/**
+      - src/xrpld/app/main/**
       - src/test/ledger/View_test.cpp
       - conanfile.py
       - ops/Dockerfile.market-delta
