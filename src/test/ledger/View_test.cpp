@@ -1128,7 +1128,12 @@ class View_test : public beast::unit_test::Suite
         {
             BEAST_EXPECT(offer && offer->getType() == ltOFFER);
             if (offer)
-                BEAST_EXPECT(view->read(keylet::offer(offer->key())) == offer);
+            {
+                auto const again = view->read(keylet::offer(offer->key()));
+                BEAST_EXPECT(again != nullptr);
+                if (again)
+                    BEAST_EXPECT(*again == *offer);
+            }
             ++offers;
         }
         BEAST_EXPECT(offers == 1);
