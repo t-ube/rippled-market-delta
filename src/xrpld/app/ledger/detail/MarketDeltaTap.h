@@ -7,6 +7,7 @@
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
 #include <xrpl/ledger/BookDirs.h>
+#include <xrpl/ledger/Ledger.h>
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/protocol/Book.h>
 #include <xrpl/protocol/Indexes.h>
@@ -90,9 +91,31 @@ public:
     }
 
     void
-    reset(Snapshot after) noexcept
+    initialize(Snapshot initial) noexcept
     {
-        enqueue(Kind::Reset, nullptr, std::move(after));
+        try
+        {
+            std::lock_guard const lock(mutex_);
+            latest_ = std::move(initial);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void
+    reset(
+        Snapshot before,
+        Snapshot after,
+        std::shared_ptr<Ledger const> oldValidated,
+        std::shared_ptr<Ledger const> newValidated) noexcept
+    {
+        enqueue(
+            Kind::Reset,
+            std::move(before),
+            std::move(after),
+            std::move(oldValidated),
+            std::move(newValidated));
     }
 
 private:
@@ -103,6 +126,8 @@ private:
         std::uint64_t revision;
         Snapshot before;
         Snapshot after;
+        std::shared_ptr<Ledger const> oldValidated;
+        std::shared_ptr<Ledger const> newValidated;
         std::chrono::steady_clock::time_point queued;
         std::uint64_t firstRevision;
         std::uint64_t coalesced = 0;
@@ -138,7 +163,12 @@ private:
     }
 
     void
-    enqueue(Kind kind, Snapshot before, Snapshot after) noexcept
+    enqueue(
+        Kind kind,
+        Snapshot before,
+        Snapshot after,
+        std::shared_ptr<Ledger const> oldValidated = {},
+        std::shared_ptr<Ledger const> newValidated = {}) noexcept
     {
         try
         {
@@ -160,7 +190,14 @@ private:
                 return;
             }
             pending_.push_back(
-                {kind, revision, std::move(before), std::move(after), now, revision});
+                {kind,
+                 revision,
+                 std::move(before),
+                 std::move(after),
+                 std::move(oldValidated),
+                 std::move(newValidated),
+                 now,
+                 revision});
             ready_.notify_one();
         }
         catch (...)
@@ -270,6 +307,74 @@ private:
                 return false;
         }
         return true;
+    }
+
+    // Rebase one open ledger on the next with the union of:
+    //  1. validated state-map differences (SHAMap hashes, not full traversal);
+    //  2. changed overlay keys from both published OpenViews.
+    // Re-read both final views for every candidate key: the new validated
+    // ledger may already contain old pending transactions, or the new open
+    // ledger may reapply transactions with different results.
+    static std::string
+    encodeAdvance(Event const& event)
+    {
+        if (!event.before || !event.after || !event.oldValidated ||
+            !event.newValidated)
+            return {};
+        if (event.newValidated->seq() != event.oldValidated->seq() + 1 ||
+            event.after->seq() != event.before->seq() + 1 ||
+            event.after->header().parentHash != event.newValidated->header().hash ||
+            event.before->header().parentHash != event.oldValidated->header().hash ||
+            event.newValidated->header().parentHash != event.oldValidated->header().hash)
+            return {};
+
+        constexpr int kMaxValidatedChanges = 50000;
+        SHAMap::Delta validated;
+        if (!event.newValidated->stateMap().compare(
+                event.oldValidated->stateMap(), validated, kMaxValidatedChanges))
+            return {};
+
+        std::set<uint256> keys;
+        for (auto const& [key, change] : validated)
+            keys.insert(key);
+        event.after->visitChangesSince(
+            *event.before,
+            [&](uint256 const& key, SLE::const_pointer, SLE::const_pointer) {
+                keys.insert(key);
+            });
+        if (keys.size() > static_cast<std::size_t>(kMaxValidatedChanges))
+            return {};
+
+        json::Value msg(json::ValueType::Object);
+        msg["schema"] = 1;
+        msg["kind"] = "ledger_advance";
+        msg["revision"] = std::to_string(event.revision);
+        msg["fromOpenLedger"] = static_cast<unsigned>(event.before->seq());
+        msg["fromParentHash"] = to_string(event.before->header().parentHash);
+        msg["openLedger"] = static_cast<unsigned>(event.after->seq());
+        msg["parentHash"] = to_string(event.after->header().parentHash);
+        msg["queueUs"] = std::to_string(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - event.queued)
+                .count());
+
+        json::Value changes(json::ValueType::Array);
+        for (auto const& key : keys)
+        {
+            auto const before = event.before->read(Keylet{ltANY, key});
+            auto const after = event.after->read(Keylet{ltANY, key});
+            if ((!marketEntry(before) && !marketEntry(after)) ||
+                (before && after && *before == *after))
+                continue;
+            json::Value change(json::ValueType::Object);
+            change["index"] = to_string(key);
+            change["action"] = !before ? "created" : !after ? "deleted" : "modified";
+            change["before"] = before ? before->getJson() : json::Value{};
+            change["after"] = after ? after->getJson() : json::Value{};
+            changes.append(std::move(change));
+        }
+        msg["changes"] = std::move(changes);
+        return json::to_string(msg) + "\n";
     }
 
     static std::string
@@ -699,14 +804,20 @@ private:
 
             try
             {
-                // A new validated ledger changes the entire base of the
-                // OpenView. A reset has no valid incremental delta relative
-                // to the previous parent ledger. Re-anchor the subscriber
-                // with a complete atomic snapshot before any later updates.
+                // In steady state an epoch transition carries only changed
+                // state keys. Snapshot is the recovery path, not the normal
+                // ledger-reset path. A bounded compare failure revokes trust.
                 if (event.kind == Kind::Reset && !subscribedPairs.empty())
                 {
-                    if (!writeSnapshot(client, event.after, event.revision, subscribedPairs))
+                    auto const advance = encodeAdvance(event);
+                    if (advance.empty() || advance.size() > 16 * 1024 * 1024 ||
+                        !writeAllOrDisconnect(
+                            client, advance, std::chrono::milliseconds(2000)))
                     {
+                        (void)writeAllOrDisconnect(
+                            client,
+                            "{\"schema\":1,\"kind\":\"resync_required\","
+                            "\"reason\":\"ledger_advance_unavailable\"}\n");
                         ::close(client);
                         client = -1;
                     }
