@@ -24,6 +24,7 @@
 #include <xrpl/core/ServiceRegistry.h>
 #include <xrpl/ledger/ApplyView.h>
 #include <xrpl/ledger/ApplyViewImpl.h>
+#include <xrpl/ledger/BookDirs.h>
 #include <xrpl/ledger/Ledger.h>
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/ledger/PaymentSandbox.h>
@@ -1105,6 +1106,43 @@ class View_test : public beast::unit_test::Suite
     }
 
     void
+    testMarketDeltaKeyedSnapshotReads()
+    {
+        testcase("MarketDelta keyed book and funding reads");
+
+        using namespace jtx;
+        Env env(*this);
+        auto const maker = Account("snapshotMaker");
+        auto const issuer = Account("snapshotIssuer");
+        auto const usd = issuer["USD"];
+        env.fund(XRP(100000), maker, issuer);
+        env.trust(usd(100), maker);
+        env(pay(issuer, maker, usd(50)));
+        env(offer(maker, usd(12), XRP(4)));
+
+        auto const view = env.current();
+        // Subscribe only to USD/XRP. BookDirs must expose the inherited
+        // validated + open-view book, without traversing unrelated SLEs.
+        std::size_t offers = 0;
+        for (auto const& offer : BookDirs(*view, Book{usd, xrpIssue(), std::nullopt}))
+        {
+            BEAST_EXPECT(offer && offer->getType() == ltOFFER);
+            if (offer)
+                BEAST_EXPECT(view->read(keylet::offer(offer->key())) == offer);
+            ++offers;
+        }
+        BEAST_EXPECT(offers == 1);
+        BEAST_EXPECT(
+            view->read(keylet::account(maker.id())) != nullptr);
+        BEAST_EXPECT(
+            view->read(keylet::account(issuer.id())) != nullptr);
+        BEAST_EXPECT(
+            view->read(keylet::trustLine(maker.id(), usd.issue())) != nullptr);
+        BEAST_EXPECT(
+            !view->read(keylet::amm(usd.issue(), xrpIssue())));
+    }
+
+    void
     run() override
     {
         // This had better work, or else
@@ -1112,6 +1150,7 @@ class View_test : public beast::unit_test::Suite
 
         testLedger();
         testMarketDeltaSnapshots();
+        testMarketDeltaKeyedSnapshotReads();
         testMeta();
         testMetaSucc();
         testStacked();
