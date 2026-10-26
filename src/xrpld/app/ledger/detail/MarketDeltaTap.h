@@ -278,6 +278,10 @@ private:
         {
             out["openLedger"] = static_cast<unsigned>(event.after->seq());
             out["parentHash"] = to_string(event.after->header().parentHash);
+            // Transactions already applied to this open ledger. The bot compares
+            // it with expected_ledger_size: at the threshold the open-ledger fee
+            // jumps to the escalation cliff and base-fee submissions queue.
+            out["openTxs"] = static_cast<unsigned>(event.after->txCount());
         }
         out["queueUs"] = std::to_string(
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -415,6 +419,7 @@ private:
         }
         out["openLedger"] = static_cast<unsigned>(event.after->seq());
         out["parentHash"] = to_string(event.after->header().parentHash);
+        out["openTxs"] = static_cast<unsigned>(event.after->txCount());
         out["queueUs"] = std::to_string(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - event.queued)
