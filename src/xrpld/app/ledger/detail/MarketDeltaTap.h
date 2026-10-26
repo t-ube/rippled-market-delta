@@ -134,6 +134,40 @@ private:
         std::uint64_t coalesced = 0;
     };
 
+    // Per-frame pipeline timing (microseconds). queueWait/compare/build are
+    // known before serialization and ride in the frame; serialize/send/total
+    // only go to the stderr summary for ledger_advance.
+    struct Timing
+    {
+        std::int64_t queueWaitUs = 0;  // enqueue -> worker dequeue
+        std::size_t queueDepth = 0;    // events still pending at dequeue
+        std::int64_t compareUs = 0;    // SHAMap::compare (advance only)
+        std::int64_t buildUs = 0;      // key selection + JSON value construction
+        std::int64_t serializeUs = 0;  // json::to_string
+        std::int64_t sendUs = 0;       // socket write complete
+        std::int64_t totalUs = 0;      // enqueue -> send complete
+    };
+
+    static std::int64_t
+    sinceUs(std::chrono::steady_clock::time_point const& t0) noexcept
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0)
+            .count();
+    }
+
+    static void
+    putTiming(json::Value& out, Timing const& t)
+    {
+        // Strings like the existing queueUs: json::Int is 32-bit.
+        json::Value timing(json::ValueType::Object);
+        timing["queueWaitUs"] = std::to_string(t.queueWaitUs);
+        timing["queueDepth"] = static_cast<unsigned>(t.queueDepth);
+        timing["compareUs"] = std::to_string(t.compareUs);
+        timing["buildUs"] = std::to_string(t.buildUs);
+        out["timing"] = std::move(timing);
+    }
+
     // Process normal events in order, but absorb ledger bursts on the worker.
     // The hard cap bounds retained snapshots if the observer stalls.
     static constexpr std::size_t maxQueued_ = 1024;
@@ -228,8 +262,9 @@ private:
     }
 
     static std::string
-    encode(Event const& event)
+    encode(Event const& event, Timing* timing = nullptr)
     {
+        auto const buildStart = std::chrono::steady_clock::now();
         json::Value out(json::ValueType::Object);
         out["schema"] = 1;
         out["revision"] = std::to_string(event.revision);
@@ -266,7 +301,16 @@ private:
                 });
             out["changes"] = std::move(changes);
         }
-        return json::to_string(out) + "\n";
+        if (timing)
+        {
+            timing->buildUs = sinceUs(buildStart);
+            putTiming(out, *timing);
+        }
+        auto const serializeStart = std::chrono::steady_clock::now();
+        auto frame = json::to_string(out) + "\n";
+        if (timing)
+            timing->serializeUs = sinceUs(serializeStart);
+        return frame;
     }
 
 #if defined(__linux__)
@@ -315,11 +359,16 @@ private:
     // subscribed pairs, may be sent in subsequent frames. Newly observed
     // market makers gain their unchanged funding entries in the SAME frame.
     static std::string
-    encodeScoped(Event const& event, std::set<std::string> const& pairs, std::set<uint256>& watched)
+    encodeScoped(
+        Event const& event,
+        std::set<std::string> const& pairs,
+        std::set<uint256>& watched,
+        Timing* timing = nullptr)
     {
         if (!event.before || !event.after || pairs.empty())
             return {};
 
+        auto const buildStart = std::chrono::steady_clock::now();
         bool const advance = event.kind == Kind::Reset;
         std::set<uint256> keys;
         if (advance)
@@ -334,8 +383,12 @@ private:
 
             constexpr int kMaxValidatedChanges = 50000;
             SHAMap::Delta validated;
-            if (!event.newValidated->stateMap().compare(
-                    event.oldValidated->stateMap(), validated, kMaxValidatedChanges))
+            auto const compareStart = std::chrono::steady_clock::now();
+            bool const compared = event.newValidated->stateMap().compare(
+                event.oldValidated->stateMap(), validated, kMaxValidatedChanges);
+            if (timing)
+                timing->compareUs = sinceUs(compareStart);
+            if (!compared)
                 return {};
             for (auto const& [key, change] : validated)
                 keys.insert(key);
@@ -457,7 +510,16 @@ private:
             if (!eligible.contains(key))
                 addChange(key, true);
         out["changes"] = std::move(changes);
+        if (timing)
+        {
+            // buildUs excludes the compare so the two can be read separately.
+            timing->buildUs = sinceUs(buildStart) - timing->compareUs;
+            putTiming(out, *timing);
+        }
+        auto const serializeStart = std::chrono::steady_clock::now();
         auto frame = json::to_string(out) + "\n";
+        if (timing)
+            timing->serializeUs = sinceUs(serializeStart);
         if (advance)
             std::fprintf(
                 stderr,
@@ -859,6 +921,7 @@ private:
             }
 
             Event event{};
+            Timing timing{};
             {
                 std::unique_lock lock(mutex_);
                 ready_.wait_for(lock, std::chrono::milliseconds(50), [&] {
@@ -883,6 +946,9 @@ private:
                     continue;
                 event = std::move(pending_.front());
                 pending_.pop_front();
+                timing = Timing{};
+                timing.queueWaitUs = sinceUs(event.queued);
+                timing.queueDepth = pending_.size();
                 // Consolidate only consecutive updates of the same open-ledger epoch.
                 // Never merge across a ledger reset; keep first/last snapshots.
                 if (event.kind == Kind::Delta && pending_.size() >= coalesceThreshold_)
@@ -909,9 +975,30 @@ private:
                 // ledger-reset path. A bounded compare failure revokes trust.
                 if (event.kind == Kind::Reset && !subscribedPairs.empty())
                 {
-                    auto const advance = encodeScoped(event, subscribedPairs, watched);
-                    if (advance.empty() || advance.size() > 16 * 1024 * 1024 ||
-                        !writeAllOrDisconnect(client, advance, std::chrono::milliseconds(2000)))
+                    auto const advance = encodeScoped(event, subscribedPairs, watched, &timing);
+                    auto const sendStart = std::chrono::steady_clock::now();
+                    bool const sent = !advance.empty() && advance.size() <= 16 * 1024 * 1024 &&
+                        writeAllOrDisconnect(client, advance, std::chrono::milliseconds(2000));
+                    timing.sendUs = sinceUs(sendStart);
+                    timing.totalUs = sinceUs(event.queued);
+                    // One line per ledger: where the advance latency went.
+                    // queueWait = waiting behind earlier deltas on this worker.
+                    std::fprintf(
+                        stderr,
+                        "market-delta: ledger_advance timing open=%u queueWait=%lldus depth=%zu "
+                        "compare=%lldus build=%lldus serialize=%lldus send=%lldus total=%lldus "
+                        "bytes=%zu%s\n",
+                        event.after ? static_cast<unsigned>(event.after->seq()) : 0u,
+                        static_cast<long long>(timing.queueWaitUs),
+                        timing.queueDepth,
+                        static_cast<long long>(timing.compareUs),
+                        static_cast<long long>(timing.buildUs),
+                        static_cast<long long>(timing.serializeUs),
+                        static_cast<long long>(timing.sendUs),
+                        static_cast<long long>(timing.totalUs),
+                        advance.size(),
+                        sent ? "" : " FAILED");
+                    if (!sent)
                     {
                         (void)writeAllOrDisconnect(
                             client,
@@ -923,8 +1010,8 @@ private:
                     continue;
                 }
                 auto const frame = subscribedPairs.empty()
-                    ? encode(event)
-                    : encodeScoped(event, subscribedPairs, watched);
+                    ? encode(event, &timing)
+                    : encodeScoped(event, subscribedPairs, watched, &timing);
                 if (frame.size() > 16 * 1024 * 1024 || !writeAllOrDisconnect(client, frame))
                 {
                     std::fprintf(
