@@ -983,6 +983,7 @@ private:
                     timing.totalUs = sinceUs(event.queued);
                     // One line per ledger: where the advance latency went.
                     // queueWait = waiting behind earlier deltas on this worker.
+                    // cspell:ignore lldus (printf's long long + microsecond suffix).
                     std::fprintf(
                         stderr,
                         "market-delta: ledger_advance timing open=%u queueWait=%lldus depth=%zu "
