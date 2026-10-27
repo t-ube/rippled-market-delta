@@ -15,6 +15,7 @@
 #include <xrpld/overlay/ReduceRelayCommon.h>
 #include <xrpld/overlay/detail/Handshake.h>
 #include <xrpld/overlay/detail/OverlayImpl.h>
+#include <xrpld/overlay/detail/PeerFirstSeen.h>
 #include <xrpld/overlay/detail/ProtocolMessage.h>
 #include <xrpld/overlay/detail/ProtocolVersion.h>
 #include <xrpld/overlay/detail/TrafficCount.h>
@@ -1963,6 +1964,12 @@ PeerImp::onMessage(std::shared_ptr<protocol::TMProposeSet> const& m)
         return;
     }
 
+    // First delivery of a trusted proposal: this peer is one hop closer to
+    // that validator than any other (Market Delta peer ranking, off by default).
+    if (auto* firstSeen = PeerFirstSeen::instance(); firstSeen && isTrusted)
+        firstSeen->noteProposal(
+            app_.getValidatorManifests().getMasterKey(publicKey), id_, remoteAddress_);
+
     if (!isTrusted)
     {
         if (tracking_.load() == Tracking::Diverged)
@@ -2546,6 +2553,14 @@ PeerImp::onMessage(std::shared_ptr<protocol::TMValidation> const& m)
             JLOG(pJournal_.trace()) << "Validation: duplicate";
             return;
         }
+
+        // First delivery of a trusted validation (same ranking as proposals).
+        if (auto* firstSeen = PeerFirstSeen::instance(); firstSeen && isTrusted)
+            firstSeen->noteValidation(
+                app_.getValidatorManifests().getMasterKey(val->getSignerPublic()),
+                val->getFieldU32(sfLedgerSequence),
+                id_,
+                remoteAddress_);
 
         if (!isTrusted && (tracking_.load() == Tracking::Diverged))
         {
