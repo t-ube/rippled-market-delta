@@ -12,6 +12,7 @@ on:
       - include/xrpl/ledger/**
       - src/xrpld/app/ledger/**
       - src/xrpld/app/main/**
+      - src/xrpld/app/misc/NetworkOPs.cpp
       - src/test/ledger/View_test.cpp
       - conanfile.py
       - ops/Dockerfile.market-delta
