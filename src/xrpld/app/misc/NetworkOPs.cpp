@@ -157,6 +157,40 @@
 namespace xrpl {
 
 /**
+ * Consensus only decides to close the open ledger and to accept the consensus
+ * set when the heartbeat fires, so with the upstream one second granularity a
+ * node advances its open ledger up to one second after the validators do, half
+ * a second on average. A validator must keep the upstream cadence, but an
+ * observing node (no validator keys) can tick faster with
+ * XRPLD_CONSENSUS_HEARTBEAT_MS (100 .. ledgerGRANULARITY). The avalanche
+ * thresholds are time based, so a faster tick only shortens the reaction time;
+ * unset or invalid values keep the upstream behaviour.
+ */
+static std::chrono::milliseconds
+consensusHeartbeatInterval(bool validator, beast::Journal j)
+{
+    auto const upstream = ConsensusParms{}.ledgerGRANULARITY;
+    auto const* env = std::getenv("XRPLD_CONSENSUS_HEARTBEAT_MS");
+    if (!env || !*env)
+        return upstream;
+    if (validator)
+    {
+        JLOG(j.warn()) << "XRPLD_CONSENSUS_HEARTBEAT_MS is ignored on a validator";
+        return upstream;
+    }
+    char* end = nullptr;
+    long const ms = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || ms < 100 || ms > upstream.count())
+    {
+        JLOG(j.warn()) << "XRPLD_CONSENSUS_HEARTBEAT_MS=" << env << " must be 100.."
+                       << upstream.count() << "; keeping " << upstream.count() << "ms";
+        return upstream;
+    }
+    JLOG(j.info()) << "Consensus heartbeat " << ms << "ms (observing node)";
+    return std::chrono::milliseconds{ms};
+}
+
+/**
  * Concrete NetworkOPs: server sequencer, network tracker, and owner of all
  * client subscription state (accounts, books, streams). Subscriptions use three
  * independent non-recursive locks (accountLock_, bookLock_, streamLock_); see
@@ -318,6 +352,7 @@ public:
         , localTX_(makeLocalTxs())
         , mode_(startValid ? OperatingMode::FULL : OperatingMode::DISCONNECTED)
         , heartbeatTimer_(ioCtx)
+        , heartbeatInterval_(consensusHeartbeatInterval(validatorKeys.keys.has_value(), journal))
         , clusterTimer_(ioCtx)
         , accountHistoryTxTimer_(ioCtx)
         , consensus_(
@@ -950,6 +985,7 @@ private:
 
     ClosureCounter<void, boost::system::error_code const&> waitHandlerCounter_;
     boost::asio::steady_timer heartbeatTimer_;
+    std::chrono::milliseconds const heartbeatInterval_;
     boost::asio::steady_timer clusterTimer_;
     boost::asio::steady_timer accountHistoryTxTimer_;
 
@@ -1191,7 +1227,7 @@ NetworkOPsImp::setHeartbeatTimer()
 {
     setTimer(
         heartbeatTimer_,
-        consensus_.parms().ledgerGRANULARITY,
+        heartbeatInterval_,
         [this]() {
             jobQueue_.addJob(JtNetopTimer, "NetHeart", [this]() { processHeartbeatTimer(); });
         },
