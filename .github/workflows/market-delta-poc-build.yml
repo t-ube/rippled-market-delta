@@ -13,6 +13,8 @@ on:
       - src/xrpld/app/ledger/**
       - src/xrpld/app/main/**
       - src/xrpld/app/misc/NetworkOPs.cpp
+      - src/xrpld/overlay/detail/PeerImp.cpp
+      - src/xrpld/overlay/detail/PeerFirstSeen.h
       - src/test/ledger/View_test.cpp
       - conanfile.py
       - ops/Dockerfile.market-delta
