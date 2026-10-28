@@ -16,6 +16,7 @@
 #include <xrpld/overlay/detail/Handshake.h>
 #include <xrpld/overlay/detail/OverlayImpl.h>
 #include <xrpld/overlay/detail/PeerFirstSeen.h>
+#include <xrpld/overlay/detail/PeerTxSeen.h>
 #include <xrpld/overlay/detail/ProtocolMessage.h>
 #include <xrpld/overlay/detail/ProtocolVersion.h>
 #include <xrpld/overlay/detail/TrafficCount.h>
@@ -1368,6 +1369,12 @@ PeerImp::handleTransaction(
         }
 
         JLOG(pJournal_.debug()) << "Got tx " << txID;
+
+        // Market Delta pre-apply tap: hand the first copy of the transaction
+        // to the local bot now, before it waits in the job queue for its
+        // signature check and open-ledger application (off by default).
+        if (auto* seenTap = PeerTxSeen::instance())
+            seenTap->seen(stx, id_);
 
         bool checkSignature = true;
         if (cluster())
