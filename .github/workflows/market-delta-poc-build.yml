@@ -15,6 +15,7 @@ on:
       - src/xrpld/app/misc/NetworkOPs.cpp
       - src/xrpld/overlay/detail/PeerImp.cpp
       - src/xrpld/overlay/detail/PeerFirstSeen.h
+      - src/xrpld/overlay/detail/PeerTxSeen.h
       - src/test/ledger/View_test.cpp
       - conanfile.py
       - ops/Dockerfile.market-delta
