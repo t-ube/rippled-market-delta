@@ -15,7 +15,10 @@
 // What: in PeerImp::handleTransaction, right after HashRouter reports the
 // first copy of a transaction, the decoded STTx is queued (one lock, no I/O)
 // and a worker thread writes one NDJSON line per transaction to a Unix socket:
-//   {"kind":"tx_seen","hash":"...","t":"<unix ms>","peer":<id>,"tx":{...}}
+//   {"kind":"tx_seen","hash":"...","t":"<unix ms>","peer":<id>,"addr":"<ip>","tx":{...}}
+// `addr` is the delivering peer's address so the bot can rank peers by how
+// often they are the first to deliver a market-moving transaction and pin
+// the best ones with [ips_fixed].
 // The node's own processing is unchanged: the job is still queued, checked and
 // applied exactly as upstream, and nothing here touches a ledger or a lock
 // that the application path holds.
@@ -26,6 +29,7 @@
 // queue is bounded and frames that cannot be written in time are dropped.
 #include <xrpld/overlay/Peer.h>
 
+#include <xrpl/beast/net/IPEndpoint.h>
 #include <xrpl/json/json_value.h>
 #include <xrpl/json/to_string.h>
 #include <xrpl/protocol/STTx.h>
@@ -93,13 +97,17 @@ public:
     // Called on the peer's I/O thread for the first copy of a transaction.
     // Only a bounded queue push; the worker owns serialization and I/O.
     void
-    seen(std::shared_ptr<STTx const> tx, Peer::id_t peer) noexcept
+    seen(
+        std::shared_ptr<STTx const> tx,
+        Peer::id_t peer,
+        beast::ip::Endpoint const& address) noexcept
     {
         try
         {
             auto const now = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
+            auto addr = address.address().to_string();
             {
                 std::lock_guard const lock(mutex_);
                 if (queue_.size() >= kMaxQueue)
@@ -107,7 +115,8 @@ public:
                     ++dropped_;
                     return;
                 }
-                queue_.push_back(Item{std::move(tx), peer, static_cast<std::int64_t>(now)});
+                queue_.push_back(
+                    Item{std::move(tx), peer, std::move(addr), static_cast<std::int64_t>(now)});
             }
             ready_.notify_one();
         }
@@ -121,6 +130,7 @@ private:
     {
         std::shared_ptr<STTx const> tx;
         Peer::id_t peer;
+        std::string addr;
         std::int64_t atMs;
     };
 
@@ -157,6 +167,7 @@ private:
         line["hash"] = to_string(item.tx->getTransactionID());
         line["t"] = std::to_string(item.atMs);  // unix ms; json::Value has no 64-bit integer
         line["peer"] = static_cast<unsigned>(item.peer);
+        line["addr"] = item.addr;
         line["tx"] = item.tx->getJson(JsonOptions::Values::None);
         return json::to_string(line) + "\n";
     }
