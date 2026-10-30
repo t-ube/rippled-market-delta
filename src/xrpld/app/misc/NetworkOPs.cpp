@@ -191,6 +191,33 @@ consensusHeartbeatInterval(bool validator, beast::Journal j)
 }
 
 /**
+ * Upstream relays a transaction to peers only after it has waited for the
+ * transaction batch and been applied to the open ledger. For a transaction
+ * submitted by a local client that wait is pure delay: under load the batch
+ * ahead of it holds hundreds of peer transactions, so this node's own
+ * transactions reach the network a second or more after submission while the
+ * rest of the network already holds every competing transaction.
+ * XRPLD_RELAY_FIRST_LOCAL=1 relays a local submission to peers as soon as its
+ * signature and local checks have passed, then queues and applies it exactly
+ * as upstream does. HashRouter remembers the relay, so the post-apply relay is
+ * suppressed and peers receive one copy. Only local submissions are affected;
+ * transactions received from peers keep the upstream store-and-forward order.
+ * Unset or any other value keeps the upstream behaviour.
+ */
+static bool
+relayFirstLocalEnabled(beast::Journal j)
+{
+    auto const* env = std::getenv("XRPLD_RELAY_FIRST_LOCAL");
+    bool const enabled = env && std::string_view{env} == "1";
+    if (enabled)
+    {
+        // JLOG expands to an if/else; the braces avoid the dangling-else warning.
+        JLOG(j.info()) << "Relaying local submissions to peers before applying them";
+    }
+    return enabled;
+}
+
+/**
  * Concrete NetworkOPs: server sequencer, network tracker, and owner of all
  * client subscription state (accounts, books, streams). Subscriptions use three
  * independent non-recursive locks (accountLock_, bookLock_, streamLock_); see
@@ -353,6 +380,7 @@ public:
         , mode_(startValid ? OperatingMode::FULL : OperatingMode::DISCONNECTED)
         , heartbeatTimer_(ioCtx)
         , heartbeatInterval_(consensusHeartbeatInterval(validatorKeys.keys.has_value(), journal))
+        , relayFirstLocal_(relayFirstLocalEnabled(journal))
         , clusterTimer_(ioCtx)
         , accountHistoryTxTimer_(ioCtx)
         , consensus_(
@@ -444,6 +472,15 @@ public:
 private:
     bool
     preProcessTransaction(std::shared_ptr<Transaction>& transaction);
+
+    /**
+     * Relay a locally submitted transaction to peers before it is applied
+     * here (XRPLD_RELAY_FIRST_LOCAL). The transaction has passed
+     * preProcessTransaction. Claims the HashRouter relay slot so apply() does
+     * not relay it a second time.
+     */
+    void
+    relayBeforeApply(Transaction& transaction);
 
     void
     doTransactionSyncBatch(
@@ -986,6 +1023,8 @@ private:
     ClosureCounter<void, boost::system::error_code const&> waitHandlerCounter_;
     boost::asio::steady_timer heartbeatTimer_;
     std::chrono::milliseconds const heartbeatInterval_;
+    bool const relayFirstLocal_;
+    std::atomic<std::uint64_t> relayedFirst_{0};
     boost::asio::steady_timer clusterTimer_;
     boost::asio::steady_timer accountHistoryTxTimer_;
 
@@ -1547,11 +1586,46 @@ NetworkOPsImp::processTransaction(
 
     if (bLocal)
     {
+        if (relayFirstLocal_)
+            relayBeforeApply(*transaction);
         doTransactionSync(transaction, bUnlimited, failType);
     }
     else
     {
         doTransactionAsync(transaction, bUnlimited, failType);
+    }
+}
+
+void
+NetworkOPsImp::relayBeforeApply(Transaction& transaction)
+{
+    auto const& sttx = *transaction.getSTransaction();
+    // preProcessTransaction has already rejected inner batch transactions;
+    // keep the relay path self-contained, as apply() does.
+    if (sttx.isFlag(tfInnerBatchTxn))
+        return;
+
+    // Claims the relay slot: apply() asks the same question later and gets
+    // nothing back, so peers see one copy. A resubmission inside the relay
+    // window is not relayed again either.
+    auto const toSkip = registry_.get().getHashRouter().shouldRelay(transaction.getID());
+    if (!toSkip)
+        return;
+
+    protocol::TMTransaction tx;
+    Serializer s;
+    sttx.add(s);
+    tx.set_rawtransaction(s.data(), s.size());
+    tx.set_status(protocol::tsCURRENT);
+    tx.set_receivetimestamp(registry_.get().getTimeKeeper().now().time_since_epoch().count());
+    tx.set_deferred(false);
+    registry_.get().getOverlay().relay(transaction.getID(), tx, *toSkip);
+
+    auto const relayed = ++relayedFirst_;
+    if (relayed % 1000 == 1)
+    {
+        JLOG(journal_.info()) << "relay-first: " << relayed
+                              << " local transactions relayed before apply";
     }
 }
 
@@ -1916,6 +1990,12 @@ NetworkOPsImp::apply(std::unique_lock<std::mutex>& batchLock)
                     tx.set_deferred(e.result == terQUEUED);
                     // FIXME: This should be when we received it
                     registry_.get().getOverlay().relay(e.transaction->getID(), tx, *toSkip);
+                    e.transaction->setBroadcast();
+                }
+                else if (relayFirstLocal_ && e.local && !sttx.isFlag(tfInnerBatchTxn))
+                {
+                    // Already relayed by relayBeforeApply(); HashRouter declined
+                    // the repeat. Only the submit result still needs the flag.
                     e.transaction->setBroadcast();
                 }
             }
