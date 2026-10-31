@@ -17,6 +17,7 @@
 #include <xrpld/app/main/CollectorManager.h>
 #include <xrpld/app/main/GRPCServer.h>
 #include <xrpld/app/main/LoadManager.h>
+#include <xrpld/app/main/MarketRelayTap.h>
 #include <xrpld/app/main/NodeIdentity.h>
 #include <xrpld/app/main/NodeStoreScheduler.h>
 #include <xrpld/app/misc/SHAMapStore.h>
@@ -1519,6 +1520,9 @@ ApplicationImp::start(bool withTimers)
     shaMapStore_->start();
     if (overlay_)
         overlay_->start();
+    // Relay-first submission socket for the Market Delta bot (no-op unless
+    // XRPLD_MARKET_DELTA_SOCKET is set). Needs the overlay, hence here.
+    MarketRelayTap::start(*this);
 
     if (grpcServer_->start())
         fixConfigPorts(*config_, {{Sections::kPortGrpc, grpcServer_->getEndpoint()}});
