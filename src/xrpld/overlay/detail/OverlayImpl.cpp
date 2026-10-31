@@ -105,6 +105,10 @@ static constexpr auto kServerCounts = (1 << 2);
 static constexpr auto kUnl = (1 << 3);
 }  // namespace crawl_options
 
+// XRPLD_RELAY_LOCAL_HOLD_MS, defined with relayLocal() below.
+static std::size_t
+relayLocalHoldMs();
+
 //------------------------------------------------------------------------------
 
 OverlayImpl::Child::Child(OverlayImpl& overlay) : overlay_(overlay)
@@ -163,6 +167,45 @@ OverlayImpl::Timer::onTimer(error_code ec)
         overlay_.deleteIdlePeers();
 
     asyncWait();
+}
+
+//------------------------------------------------------------------------------
+
+OverlayImpl::HoldTimer::HoldTimer(OverlayImpl& overlay) : Child(overlay), timer(overlay_.ioContext_)
+{
+}
+
+void
+OverlayImpl::HoldTimer::stop()
+{
+    // Same strand as onTimer, never concurrent with it.
+    stopping = true;
+    timer.cancel();
+}
+
+void
+OverlayImpl::HoldTimer::armAt(clock_type::time_point when)
+{
+    timer.expires_at(when);
+    timer.async_wait(
+        boost::asio::bind_executor(
+            overlay_.strand_,
+            [self = shared_from_this()](error_code const& ec) { self->onTimer(ec); }));
+}
+
+void
+OverlayImpl::HoldTimer::onTimer(error_code ec)
+{
+    if (ec || stopping)
+    {
+        if (ec && ec != boost::asio::error::operation_aborted)
+        {
+            JLOG(overlay_.journal_.error()) << "hold timer: " << ec.message();
+        }
+        return;
+    }
+
+    overlay_.releaseDeferredRelays(*this);
 }
 
 //------------------------------------------------------------------------------
@@ -591,10 +634,18 @@ OverlayImpl::start()
             });
     }
     auto const timer = std::make_shared<Timer>(*this);
+    auto const hold = std::make_shared<HoldTimer>(*this);
     std::scoped_lock const lock(mutex_);
     list_.emplace(timer.get(), timer);
     timer_ = timer;
     timer->asyncWait();
+    list_.emplace(hold.get(), hold);
+    holdTimer_ = hold;
+    if (auto const ms = relayLocalHoldMs(); ms > 0)
+    {
+        JLOG(journal_.info()) << "Holding peer transaction relay for " << ms
+                              << " ms after each burst of local transactions";
+    }
 }
 
 void
@@ -1327,6 +1378,33 @@ OverlayImpl::getManifestsMessage()
 }
 
 /**
+ * For how long, after a locally originated transaction went out, the relay of
+ * peers' transactions is held back (XRPLD_RELAY_LOCAL_HOLD_MS). 0 or unset:
+ * off, as upstream.
+ *
+ * Why: the bot's burst (a few hundred transactions to the ranked peers) shares
+ * the uplink and every peer's send queue with the store-and-forward relay of
+ * everything else the node just applied, which in a storm comes out in lumps
+ * of ~20 MB. With the hold set, our transactions also jump the per-peer send
+ * queue (PeerImp::sendPriority), and the relay of other transactions waits
+ * until the hold expires. Held transactions older than a second are dropped
+ * instead of sent: by then every peer has them from somewhere else.
+ */
+static std::size_t
+relayLocalHoldMs()
+{
+    static std::size_t const ms = [] {
+        auto const* env = std::getenv("XRPLD_RELAY_LOCAL_HOLD_MS");
+        if (!env || !*env)
+            return std::size_t{0};
+        char* end = nullptr;
+        long const n = std::strtol(env, &end, 10);
+        return (end != env && *end == '\0' && n > 0) ? static_cast<std::size_t>(n) : std::size_t{0};
+    }();
+    return ms;
+}
+
+/**
  * How many peers a locally originated transaction is relayed to
  * (XRPLD_RELAY_LOCAL_MAX_PEERS). 0 or unset: all of them, as upstream.
  *
@@ -1359,7 +1437,8 @@ OverlayImpl::relayLocal(
     std::set<Peer::id_t> const& toSkip)
 {
     auto const limit = relayLocalMaxPeers();
-    if (limit == 0)
+    auto const holdMs = relayLocalHoldMs();
+    if (limit == 0 && holdMs == 0)
     {
         relay(hash, m, toSkip);
         return;
@@ -1379,25 +1458,114 @@ OverlayImpl::relayLocal(
             score += std::uint64_t{1} << 40;
         ranked.emplace_back(score, p);
     });
-    if (ranked.size() <= limit)
+
+    auto const count = (limit == 0 || ranked.size() <= limit) ? ranked.size() : limit;
+    if (count < ranked.size())
     {
-        relay(hash, m, toSkip);
-        return;
+        std::stable_sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) {
+            return a.first > b.first;
+        });
     }
-    std::stable_sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) {
-        return a.first > b.first;
-    });
+
+    if (holdMs > 0)
+    {
+        auto const until = clock_type::now() + std::chrono::milliseconds(holdMs);
+        relayHoldUntil_.store(until.time_since_epoch().count());
+    }
 
     auto const sm = std::make_shared<Message>(m, protocol::mtTRANSACTION);
-    for (std::size_t i = 0; i < limit; ++i)
-        ranked[i].second->send(sm);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (holdMs > 0)
+            ranked[i].second->sendPriority(sm);
+        else
+            ranked[i].second->send(sm);
+    }
 
     static std::atomic<std::uint64_t> relayed{0};
     auto const n = ++relayed;
     if (n % 1000 == 1)
     {
-        JLOG(journal_.info()) << "relay-local: " << n << " local transactions relayed to " << limit
-                              << " of " << ranked.size() << " peers";
+        JLOG(journal_.info()) << "relay-local: " << n << " local transactions relayed to " << count
+                              << " of " << ranked.size() << " peers"
+                              << (holdMs > 0 ? " (priority, hold " + std::to_string(holdMs) + " ms)"
+                                             : "");
+    }
+}
+
+bool
+OverlayImpl::deferRelayIfHeld(std::shared_ptr<Message> const& m, PeerSequence const& peers)
+{
+    if (relayLocalHoldMs() == 0)
+        return false;
+
+    auto const now = clock_type::now();
+    auto const until = clock_type::time_point{clock_type::duration{relayHoldUntil_.load()}};
+    if (now >= until)
+        return false;
+
+    auto const timer = holdTimer_.lock();
+    if (!timer)
+        return false;
+
+    bool arm = false;
+    {
+        std::scoped_lock const lock(deferredMutex_);
+        deferred_.push_back({m, peers, now + std::chrono::seconds(1)});
+        if (!deferredArmed_)
+        {
+            deferredArmed_ = true;
+            arm = true;
+        }
+    }
+    if (arm)
+        boost::asio::post(strand_, [timer, until] { timer->armAt(until); });
+    return true;
+}
+
+void
+OverlayImpl::releaseDeferredRelays(HoldTimer& timer)
+{
+    auto const now = clock_type::now();
+    auto const until = clock_type::time_point{clock_type::duration{relayHoldUntil_.load()}};
+
+    std::vector<DeferredRelay> batch;
+    {
+        std::scoped_lock const lock(deferredMutex_);
+        if (now < until)
+        {
+            // Another burst extended the hold. Keep waiting, but do not let
+            // stale entries pile up.
+            auto const before = deferred_.size();
+            std::erase_if(deferred_, [&](DeferredRelay const& d) { return d.expires <= now; });
+            deferredDropped_ += before - deferred_.size();
+            timer.armAt(until);
+            return;
+        }
+        batch.swap(deferred_);
+        deferredArmed_ = false;
+    }
+
+    std::size_t released = 0;
+    std::size_t dropped = 0;
+    for (auto const& d : batch)
+    {
+        if (d.expires <= now)
+        {
+            ++dropped;
+            continue;
+        }
+        for (auto const& p : d.peers)
+            p->send(d.message);
+        ++released;
+    }
+    deferredReleased_ += released;
+    deferredDropped_ += dropped;
+    if (released + dropped > 0)
+    {
+        JLOG(journal_.info()) << "relay-hold: released " << released << ", dropped " << dropped
+                              << " peer transactions (total " << deferredReleased_.load() << " / "
+                              << deferredDropped_.load() << ")";
     }
 }
 
@@ -1448,6 +1616,8 @@ OverlayImpl::relay(
 
     if (!app_.config().txReduceRelayEnable || total <= minRelay)
     {
+        if (deferRelayIfHeld(sm, peers))
+            return;
         for (auto const& p : peers)
             p->send(sm);
         if (app_.config().txReduceRelayEnable || app_.config().txReduceRelayMetrics)

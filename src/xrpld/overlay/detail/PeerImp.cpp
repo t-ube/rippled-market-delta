@@ -278,7 +278,19 @@ PeerImp::stop()
 void
 PeerImp::send(std::shared_ptr<Message> const& m)
 {
-    dispatch(strand_, [self = shared_from_this(), m]() {
+    sendImpl(m, false);
+}
+
+void
+PeerImp::sendPriority(std::shared_ptr<Message> const& m)
+{
+    sendImpl(m, true);
+}
+
+void
+PeerImp::sendImpl(std::shared_ptr<Message> const& m, bool priority)
+{
+    dispatch(strand_, [self = shared_from_this(), m, priority]() {
         if (self->gracefulClose_)
             return;
         if (self->detaching_)
@@ -322,14 +334,26 @@ PeerImp::send(std::shared_ptr<Message> const& m)
             sink << n << " sendq: " << sendqSize;
         }
 
-        self->sendQueue_.push(m);
+        if (priority && sendqSize != 0)
+        {
+            // The front message is being written; go behind it and behind
+            // the priority messages already waiting there.
+            auto const pos = std::min(1 + self->priorityQueued_, sendqSize);
+            self->sendQueue_.insert(
+                self->sendQueue_.begin() + static_cast<std::ptrdiff_t>(pos), Queued{m, true});
+            ++self->priorityQueued_;
+            return;
+        }
+
+        self->sendQueue_.push_back(Queued{m, false});
 
         if (sendqSize != 0)
             return;
 
         boost::asio::async_write(
             self->stream_,
-            boost::asio::buffer(self->sendQueue_.front()->getBuffer(self->compressionEnabled_)),
+            boost::asio::buffer(
+                self->sendQueue_.front().message->getBuffer(self->compressionEnabled_)),
             bind_executor(
                 self->strand_, [self](error_code const& ec, std::size_t bytesTransferred) {
                     self->onWriteMessage(ec, bytesTransferred);
@@ -1011,13 +1035,19 @@ PeerImp::onWriteMessage(error_code ec, std::size_t bytesTransferred)
     metrics_.sent.addMessage(bytesTransferred);
 
     XRPL_ASSERT(!sendQueue_.empty(), "xrpl::PeerImp::onWriteMessage : non-empty send buffer");
-    sendQueue_.pop();
+    sendQueue_.pop_front();
     if (!sendQueue_.empty())
     {
+        if (auto& next = sendQueue_.front(); next.priority)
+        {
+            // Now in flight: no longer part of the waiting priority block.
+            next.priority = false;
+            --priorityQueued_;
+        }
         // Timeout on writes only
         boost::asio::async_write(
             stream_,
-            boost::asio::buffer(sendQueue_.front()->getBuffer(compressionEnabled_)),
+            boost::asio::buffer(sendQueue_.front().message->getBuffer(compressionEnabled_)),
             bind_executor(
                 strand_,
                 [self = shared_from_this()](error_code const& ec, std::size_t bytesTransferred) {

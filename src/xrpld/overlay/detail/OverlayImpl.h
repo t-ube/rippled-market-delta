@@ -106,6 +106,34 @@ private:
         onTimer(error_code ec);
     };
 
+    /**
+     * Releases peer transactions whose relay was held back while a burst of
+     * our own transactions was going out (XRPLD_RELAY_LOCAL_HOLD_MS).
+     */
+    struct HoldTimer : Child, std::enable_shared_from_this<HoldTimer>
+    {
+        boost::asio::basic_waitable_timer<clock_type> timer;
+        bool stopping{false};
+
+        explicit HoldTimer(OverlayImpl& overlay);
+
+        void
+        stop() override;
+
+        void
+        armAt(clock_type::time_point when);
+
+        void
+        onTimer(error_code ec);
+    };
+
+    struct DeferredRelay
+    {
+        std::shared_ptr<Message> message;
+        PeerSequence peers;
+        clock_type::time_point expires;
+    };
+
     Application& app_;
     boost::asio::io_context& ioContext_;
     std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_;
@@ -141,6 +169,17 @@ private:
     std::optional<std::uint32_t> manifestListSeq_;
     // Protects the message and the sequence list of manifests
     std::mutex manifestLock_;
+
+    // Relay hold (XRPLD_RELAY_LOCAL_HOLD_MS): peer transactions are not relayed
+    // until relayHoldUntil_ (steady_clock ticks) has passed; they wait in
+    // deferred_ and HoldTimer releases them. Both guarded by deferredMutex_.
+    std::weak_ptr<HoldTimer> holdTimer_;
+    std::atomic<clock_type::rep> relayHoldUntil_{0};
+    std::mutex deferredMutex_;
+    std::vector<DeferredRelay> deferred_;
+    bool deferredArmed_{false};
+    std::atomic<std::uint64_t> deferredReleased_{0};
+    std::atomic<std::uint64_t> deferredDropped_{0};
 
     //--------------------------------------------------------------------------
 
@@ -254,6 +293,14 @@ public:
 
     std::shared_ptr<Message>
     getManifestsMessage();
+
+    // True if the relay was queued because a local burst is in progress.
+    bool
+    deferRelayIfHeld(std::shared_ptr<Message> const& m, PeerSequence const& peers);
+
+    // Runs on strand_ from HoldTimer.
+    void
+    releaseDeferredRelays(HoldTimer& timer);
 
     //--------------------------------------------------------------------------
     //
