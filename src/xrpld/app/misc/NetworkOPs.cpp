@@ -1619,7 +1619,7 @@ NetworkOPsImp::relayBeforeApply(Transaction& transaction)
     tx.set_status(protocol::tsCURRENT);
     tx.set_receivetimestamp(registry_.get().getTimeKeeper().now().time_since_epoch().count());
     tx.set_deferred(false);
-    registry_.get().getOverlay().relay(transaction.getID(), tx, *toSkip);
+    registry_.get().getOverlay().relayLocal(transaction.getID(), tx, *toSkip);
 
     auto const relayed = ++relayedFirst_;
     if (relayed % 1000 == 1)

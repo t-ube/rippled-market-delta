@@ -5,6 +5,7 @@
 #include <xrpld/overlay/Cluster.h>
 #include <xrpld/overlay/detail/ConnectAttempt.h>
 #include <xrpld/overlay/detail/Handshake.h>
+#include <xrpld/overlay/detail/PeerFirstSeen.h>
 #include <xrpld/overlay/detail/PeerImp.h>
 #include <xrpld/overlay/detail/ProtocolVersion.h>
 #include <xrpld/overlay/detail/TrafficCount.h>
@@ -73,9 +74,11 @@
 #include <xrpl.pb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iomanip>
@@ -1321,6 +1324,81 @@ OverlayImpl::getManifestsMessage()
     }
 
     return manifestMessage_;
+}
+
+/**
+ * How many peers a locally originated transaction is relayed to
+ * (XRPLD_RELAY_LOCAL_MAX_PEERS). 0 or unset: all of them, as upstream.
+ *
+ * Why: the Market Delta bot answers one opportunity with up to a few hundred
+ * Batch transactions of ~1.5 KB, and the node sends every one of them to every
+ * peer. 370 transactions x 1.5 KB x 90 peers is 50 MB, 0.4 s of a 1 Gbit/s
+ * uplink, about the length of the validators' open window, so the tail of the
+ * burst reaches them late and a second opportunity in the same ledger queues
+ * behind the first. The validators get one copy each either way; the peers
+ * left out hear about the transactions from them.
+ */
+static std::size_t
+relayLocalMaxPeers()
+{
+    static std::size_t const limit = [] {
+        auto const* env = std::getenv("XRPLD_RELAY_LOCAL_MAX_PEERS");
+        if (!env || !*env)
+            return std::size_t{0};
+        char* end = nullptr;
+        long const n = std::strtol(env, &end, 10);
+        return (end != env && *end == '\0' && n > 0) ? static_cast<std::size_t>(n) : std::size_t{0};
+    }();
+    return limit;
+}
+
+void
+OverlayImpl::relayLocal(
+    uint256 const& hash,
+    protocol::TMTransaction& m,
+    std::set<Peer::id_t> const& toSkip)
+{
+    auto const limit = relayLocalMaxPeers();
+    if (limit == 0)
+    {
+        relay(hash, m, toSkip);
+        return;
+    }
+
+    // Rank: configured ([ips_fixed]) and cluster peers first, then by how
+    // often the peer has been the first to deliver a trusted proposal or
+    // validation (PeerFirstSeen, when enabled), i.e. how close it sits to the
+    // validators. Ties keep the iteration order.
+    auto const* firstSeen = PeerFirstSeen::instance();
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<PeerImp>>> ranked;
+    forEach([&](std::shared_ptr<PeerImp> const& p) {
+        if (toSkip.contains(p->id()))
+            return;
+        std::uint64_t score = firstSeen ? firstSeen->score(p->id()) : 0;
+        if (p->cluster() || (p->slot() && p->slot()->fixed()))
+            score += std::uint64_t{1} << 40;
+        ranked.emplace_back(score, p);
+    });
+    if (ranked.size() <= limit)
+    {
+        relay(hash, m, toSkip);
+        return;
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) {
+        return a.first > b.first;
+    });
+
+    auto const sm = std::make_shared<Message>(m, protocol::mtTRANSACTION);
+    for (std::size_t i = 0; i < limit; ++i)
+        ranked[i].second->send(sm);
+
+    static std::atomic<std::uint64_t> relayed{0};
+    auto const n = ++relayed;
+    if (n % 1000 == 1)
+    {
+        JLOG(journal_.info()) << "relay-local: " << n << " local transactions relayed to " << limit
+                              << " of " << ranked.size() << " peers";
+    }
 }
 
 void

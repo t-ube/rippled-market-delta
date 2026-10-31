@@ -204,7 +204,8 @@ private:
             msg.set_status(protocol::tsCURRENT);
             msg.set_receivetimestamp(registry_.getTimeKeeper().now().time_since_epoch().count());
             msg.set_deferred(false);
-            registry_.getOverlay().relay(txid, msg, *toSkip);
+            // relayLocal: XRPLD_RELAY_LOCAL_MAX_PEERS caps the fan-out
+            registry_.getOverlay().relayLocal(txid, msg, *toSkip);
             relayed = true;
         }
         reply["ok"] = true;

@@ -60,8 +60,20 @@ public:
         std::lock_guard lock(mutex_);
         auto& stat = statFor(peer, address);
         ++stat.proposals;
+        ++stat.score;
         ++proposals_;
         stat.validators.insert(shortKey(validator));
+    }
+
+    // How validator-adjacent a peer has looked recently: first-seen proposals
+    // and validations, halved at every report so the ranking follows the
+    // current topology. 0 for a peer that has never delivered one first.
+    std::uint64_t
+    score(Peer::id_t peer) const
+    {
+        std::lock_guard lock(mutex_);
+        auto const it = peers_.find(peer);
+        return it == peers_.end() ? 0 : it->second.score;
     }
 
     void
@@ -74,6 +86,7 @@ public:
         std::lock_guard lock(mutex_);
         auto& stat = statFor(peer, address);
         ++stat.validations;
+        ++stat.score;
         ++validations_;
         stat.validators.insert(shortKey(validator));
         if (ledgerSeq > lastSeq_)
@@ -90,6 +103,7 @@ private:
         std::string address;
         std::uint64_t proposals = 0;
         std::uint64_t validations = 0;
+        std::uint64_t score = 0;
         std::set<std::string> validators;
     };
 
@@ -120,7 +134,8 @@ private:
         std::vector<std::pair<Peer::id_t, PeerStat const*>> rows;
         rows.reserve(peers_.size());
         for (auto const& [id, stat] : peers_)
-            rows.emplace_back(id, &stat);
+            if (stat.proposals + stat.validations)  // skip peers only kept for their decayed score
+                rows.emplace_back(id, &stat);
         std::sort(rows.begin(), rows.end(), [](auto const& a, auto const& b) {
             return a.second->validations + a.second->proposals >
                 b.second->validations + b.second->proposals;
@@ -133,7 +148,7 @@ private:
             lastSeq_,
             static_cast<unsigned long long>(proposals_),
             static_cast<unsigned long long>(validations_),
-            peers_.size());
+            rows.size());
         std::size_t shown = 0;
         for (auto const& [id, stat] : rows)
         {
@@ -166,14 +181,27 @@ private:
                 keys.str().c_str());
         }
         std::fflush(stderr);
-        peers_.clear();
+        // Start the window over but keep a halved score so the relay ranking
+        // (score()) remembers the last windows; peers that stopped delivering
+        // fade out in a few reports.
+        for (auto it = peers_.begin(); it != peers_.end();)
+        {
+            it->second.proposals = 0;
+            it->second.validations = 0;
+            it->second.validators.clear();
+            it->second.score /= 2;
+            if (it->second.score == 0)
+                it = peers_.erase(it);
+            else
+                ++it;
+        }
         proposals_ = 0;
         validations_ = 0;
         firstSeq_ = lastSeq_;
     }
 
     std::uint32_t const interval_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unordered_map<Peer::id_t, PeerStat> peers_;
     std::uint64_t proposals_ = 0;
     std::uint64_t validations_ = 0;
