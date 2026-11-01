@@ -184,9 +184,9 @@ OverlayImpl::HoldTimer::stop()
 }
 
 void
-OverlayImpl::HoldTimer::armAt(clock_type::time_point when)
+OverlayImpl::HoldTimer::asyncWait()
 {
-    timer.expires_at(when);
+    timer.expires_after(std::chrono::milliseconds(50));
     timer.async_wait(
         boost::asio::bind_executor(
             overlay_.strand_,
@@ -205,7 +205,8 @@ OverlayImpl::HoldTimer::onTimer(error_code ec)
         return;
     }
 
-    overlay_.releaseDeferredRelays(*this);
+    overlay_.releaseDeferredRelays();
+    asyncWait();
 }
 
 //------------------------------------------------------------------------------
@@ -639,10 +640,11 @@ OverlayImpl::start()
     list_.emplace(timer.get(), timer);
     timer_ = timer;
     timer->asyncWait();
-    list_.emplace(hold.get(), hold);
-    holdTimer_ = hold;
     if (auto const ms = relayLocalHoldMs(); ms > 0)
     {
+        list_.emplace(hold.get(), hold);
+        holdTimer_ = hold;
+        hold->asyncWait();
         JLOG(journal_.info()) << "Holding peer transaction relay for " << ms
                               << " ms after each burst of local transactions";
     }
@@ -1504,27 +1506,17 @@ OverlayImpl::deferRelayIfHeld(std::shared_ptr<Message> const& m, PeerSequence co
     if (now >= until)
         return false;
 
-    auto const timer = holdTimer_.lock();
-    if (!timer)
+    // Nothing releases the queue once the overlay is stopping.
+    if (holdTimer_.expired())
         return false;
 
-    bool arm = false;
-    {
-        std::scoped_lock const lock(deferredMutex_);
-        deferred_.push_back({m, peers, now + std::chrono::seconds(1)});
-        if (!deferredArmed_)
-        {
-            deferredArmed_ = true;
-            arm = true;
-        }
-    }
-    if (arm)
-        boost::asio::post(strand_, [timer, until] { timer->armAt(until); });
+    std::scoped_lock const lock(deferredMutex_);
+    deferred_.push_back({m, peers, now + std::chrono::seconds(1)});
     return true;
 }
 
 void
-OverlayImpl::releaseDeferredRelays(HoldTimer& timer)
+OverlayImpl::releaseDeferredRelays()
 {
     auto const now = clock_type::now();
     auto const until = clock_type::time_point{clock_type::duration{relayHoldUntil_.load()}};
@@ -1532,18 +1524,18 @@ OverlayImpl::releaseDeferredRelays(HoldTimer& timer)
     std::vector<DeferredRelay> batch;
     {
         std::scoped_lock const lock(deferredMutex_);
+        if (deferred_.empty())
+            return;
         if (now < until)
         {
-            // Another burst extended the hold. Keep waiting, but do not let
-            // stale entries pile up.
+            // A burst is still going out. Keep holding, but do not let stale
+            // entries pile up.
             auto const before = deferred_.size();
             std::erase_if(deferred_, [&](DeferredRelay const& d) { return d.expires <= now; });
             deferredDropped_ += before - deferred_.size();
-            timer.armAt(until);
             return;
         }
         batch.swap(deferred_);
-        deferredArmed_ = false;
     }
 
     std::size_t released = 0;
@@ -1561,7 +1553,8 @@ OverlayImpl::releaseDeferredRelays(HoldTimer& timer)
     }
     deferredReleased_ += released;
     deferredDropped_ += dropped;
-    if (released + dropped > 0)
+    static std::uint64_t releases = 0;  // strand_ only
+    if (released + dropped > 0 && (++releases % 100) == 1)
     {
         JLOG(journal_.info()) << "relay-hold: released " << released << ", dropped " << dropped
                               << " peer transactions (total " << deferredReleased_.load() << " / "

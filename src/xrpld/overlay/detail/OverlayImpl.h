@@ -120,8 +120,11 @@ private:
         void
         stop() override;
 
+        // Ticks every 50 ms while the overlay runs. The pending wait is what
+        // keeps the timer alive (the overlay only holds weak pointers to its
+        // children), exactly like Timer::asyncWait.
         void
-        armAt(clock_type::time_point when);
+        asyncWait();
 
         void
         onTimer(error_code ec);
@@ -177,7 +180,6 @@ private:
     std::atomic<clock_type::rep> relayHoldUntil_{0};
     std::mutex deferredMutex_;
     std::vector<DeferredRelay> deferred_;
-    bool deferredArmed_{false};
     std::atomic<std::uint64_t> deferredReleased_{0};
     std::atomic<std::uint64_t> deferredDropped_{0};
 
@@ -300,7 +302,7 @@ public:
 
     // Runs on strand_ from HoldTimer.
     void
-    releaseDeferredRelays(HoldTimer& timer);
+    releaseDeferredRelays();
 
     //--------------------------------------------------------------------------
     //
