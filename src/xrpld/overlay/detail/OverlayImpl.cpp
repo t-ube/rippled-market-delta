@@ -1407,6 +1407,26 @@ relayLocalHoldMs()
 }
 
 /**
+ * Whether [ips_fixed] peers are always placed at the head of the relay ranking
+ * (XRPLD_RELAY_LOCAL_FIXED_FIRST). Unset or 1: yes, as before. 0: fixed peers
+ * compete on their PeerFirstSeen score like everybody else.
+ *
+ * Why: [ips_fixed] is also the only way to keep a peer connected, so it ends up
+ * holding peers chosen for a different job (delivering other people's
+ * transactions to us early). Those should not displace the validator-adjacent
+ * peers from the relay set. Cluster peers keep their priority either way.
+ */
+static bool
+relayLocalFixedFirst()
+{
+    static bool const fixedFirst = [] {
+        auto const* env = std::getenv("XRPLD_RELAY_LOCAL_FIXED_FIRST");
+        return !env || !*env || std::string_view{env} != "0";
+    }();
+    return fixedFirst;
+}
+
+/**
  * How many peers a locally originated transaction is relayed to
  * (XRPLD_RELAY_LOCAL_MAX_PEERS). 0 or unset: all of them, as upstream.
  *
@@ -1446,17 +1466,19 @@ OverlayImpl::relayLocal(
         return;
     }
 
-    // Rank: configured ([ips_fixed]) and cluster peers first, then by how
-    // often the peer has been the first to deliver a trusted proposal or
-    // validation (PeerFirstSeen, when enabled), i.e. how close it sits to the
-    // validators. Ties keep the iteration order.
+    // Rank: cluster peers (and, unless XRPLD_RELAY_LOCAL_FIXED_FIRST=0,
+    // configured [ips_fixed] peers) first, then by how often the peer has been
+    // the first to deliver a trusted proposal or validation (PeerFirstSeen,
+    // when enabled), i.e. how close it sits to the validators. Ties keep the
+    // iteration order.
     auto const* firstSeen = PeerFirstSeen::instance();
+    bool const fixedFirst = relayLocalFixedFirst();
     std::vector<std::pair<std::uint64_t, std::shared_ptr<PeerImp>>> ranked;
     forEach([&](std::shared_ptr<PeerImp> const& p) {
         if (toSkip.contains(p->id()))
             return;
         std::uint64_t score = firstSeen ? firstSeen->score(p->id()) : 0;
-        if (p->cluster() || (p->slot() && p->slot()->fixed()))
+        if (p->cluster() || (fixedFirst && p->slot() && p->slot()->fixed()))
             score += std::uint64_t{1} << 40;
         ranked.emplace_back(score, p);
     });
@@ -1491,7 +1513,8 @@ OverlayImpl::relayLocal(
         JLOG(journal_.info()) << "relay-local: " << n << " local transactions relayed to " << count
                               << " of " << ranked.size() << " peers"
                               << (holdMs > 0 ? " (priority, hold " + std::to_string(holdMs) + " ms)"
-                                             : "");
+                                             : "")
+                              << (fixedFirst ? "" : " (fixed peers ranked by score)");
     }
 }
 
