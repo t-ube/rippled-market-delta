@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -193,7 +194,15 @@ private:
     http_request_type request_;
     http_response_type response_;
     boost::beast::http::fields const& headers_;
-    std::queue<std::shared_ptr<Message>> sendQueue_;
+    // front() is the write in flight. Priority messages (sendPriority) sit
+    // right behind it, in order, and priorityQueued_ counts them.
+    struct Queued
+    {
+        std::shared_ptr<Message> message;
+        bool priority;
+    };
+    std::deque<Queued> sendQueue_;
+    std::size_t priorityQueued_ = 0;
     bool gracefulClose_ = false;
     int largeSendq_ = 0;
     std::unique_ptr<LoadEvent> loadEvent_;
@@ -312,6 +321,16 @@ public:
 
     void
     send(std::shared_ptr<Message> const& m) override;
+
+    /**
+     * Like send(), but the message is queued right behind the write in
+     * flight instead of behind everything already waiting on this socket.
+     * Used for locally originated transactions when XRPLD_RELAY_LOCAL_HOLD_MS
+     * is set, so a burst of our own transactions is not stuck behind a few
+     * hundred relayed ones.
+     */
+    void
+    sendPriority(std::shared_ptr<Message> const& m);
 
     /**
      * Send aggregated transactions' hashes
@@ -540,6 +559,9 @@ private:
     // Called when protocol messages bytes are sent
     void
     onWriteMessage(error_code ec, std::size_t bytesTransferred);
+
+    void
+    sendImpl(std::shared_ptr<Message> const& m, bool priority);
 
     /**
      * Called from onMessage(TMTransaction(s)).

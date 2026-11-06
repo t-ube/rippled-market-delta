@@ -1,0 +1,6 @@
+# Preserve official 3.4.1 runtime filesystem, entrypoint, configs, and data layout.
+# Only replace the xrpld executable with the tested fork build.
+ARG UPSTREAM_IMAGE=xrplf/xrpld:3.4.1
+FROM ${UPSTREAM_IMAGE}
+ARG TARGET_BIN
+COPY --chmod=0755 build/xrpld ${TARGET_BIN}

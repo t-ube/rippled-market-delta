@@ -188,6 +188,20 @@ public:
         std::set<Peer::id_t> const& toSkip) = 0;
 
     /**
+     * Relay a transaction that originated on this node (an RPC submit or the
+     * Market Delta relay tap). Upstream behaviour is relay(): every peer gets
+     * a copy. With XRPLD_RELAY_LOCAL_MAX_PEERS set, OverlayImpl sends it to
+     * that many peers only, the ones closest to the validators first, so a
+     * burst of hundreds of local transactions does not spend the uplink on
+     * peers that would hear about them from the validators anyway.
+     */
+    virtual void
+    relayLocal(uint256 const& hash, protocol::TMTransaction& m, std::set<Peer::id_t> const& toSkip)
+    {
+        relay(hash, m, toSkip);
+    }
+
+    /**
      * Visit every active peer.
      *
      * The visitor must be invocable as:

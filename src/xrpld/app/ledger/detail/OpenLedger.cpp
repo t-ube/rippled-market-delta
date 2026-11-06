@@ -1,5 +1,6 @@
 #include <xrpld/app/ledger/OpenLedger.h>
 
+#include <xrpld/app/ledger/detail/MarketDeltaTap.h>
 #include <xrpld/app/main/Application.h>
 #include <xrpld/app/misc/TxQ.h>
 #include <xrpld/core/TimeKeeper.h>
@@ -42,8 +43,13 @@ OpenLedger::OpenLedger(
     std::shared_ptr<Ledger const> const& ledger,
     CachedSLEs& cache,
     beast::Journal journal)
-    : j_(journal), cache_(cache), current_(create(ledger->rules(), ledger))
+    : j_(journal)
+    , cache_(cache)
+    , current_(create(ledger->rules(), ledger))
+    , marketDeltaBase_(ledger)
 {
+    if (auto* tap = MarketDeltaTap::instance())
+        tap->initialize(current_);
 }
 
 bool
@@ -64,12 +70,17 @@ bool
 OpenLedger::modify(modify_type const& f)
 {
     std::scoped_lock const lock1(modifyMutex_);
+    auto previous = current_;
     auto next = std::make_shared<OpenView>(*current_);
     auto const changed = f(*next, j_);
     if (changed)
     {
         std::scoped_lock const lock2(currentMutex_);
         current_ = std::move(next);
+        // Emit only after the complete proposed view has been published.
+        // This avoids leaking rolled-back tfAllOrNothing Batch inner effects.
+        if (auto* tap = MarketDeltaTap::instance())
+            tap->modified(std::move(previous), current_);
     }
     return changed;
 }
@@ -154,9 +165,16 @@ OpenLedger::accept(
         }
     }
 
-    // Switch to the new open view
+    // Switch to the new open view. The old and new validated bases,
+    // together with the two overlays, are pinned in a bounded observer
+    // event so the diff is computed off the transaction application thread.
     std::scoped_lock const lock2(currentMutex_);
+    auto const previous = current_;
+    auto const previousBase = marketDeltaBase_;
     current_ = std::move(next);
+    marketDeltaBase_ = ledger;
+    if (auto* tap = MarketDeltaTap::instance())
+        tap->reset(previous, current_, previousBase, ledger);
 }
 
 //------------------------------------------------------------------------------
