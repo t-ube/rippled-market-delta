@@ -145,6 +145,15 @@ private:
     handle(std::string const& line)
     {
         auto const started = std::chrono::steady_clock::now();
+        // 0013: wall-clock epoch ms at receipt and at reply (same host clock as
+        // the bot), so the bot can split its ack round trip into "queue before
+        // the fork" and "bot picked the reply up late".
+        auto const epochMs = [] {
+            return static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count());
+        };
+        auto const tRecv = epochMs();
         json::Value reply(json::ValueType::Object);
         json::Value request;
         json::Reader reader;
@@ -213,6 +222,8 @@ private:
         reply["us"] = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - started)
                                                 .count());
+        reply["t_recv"] = tRecv;
+        reply["t_reply"] = epochMs();
         return json::to_string(reply) + "\n";
     }
 
